@@ -450,19 +450,49 @@ demo.queue(max_size=32).launch(
 )
 WEBUI_PY
 
-# --- CLI Tool ---
+# --- CLI Tool (自包含，无需激活 venv) ---
 cat > "$INSTALL_DIR/ai" << 'CLI_PY'
 #!/usr/bin/env python3
-"""CLI AI coding assistant - direct DeepSeek API calls."""
+"""CLI AI coding assistant - direct DeepSeek API calls.
+
+This script is self-contained: it adds the venv site-packages at runtime,
+so it works even without activating the virtual environment first.
+"""
 import os, sys, json
 from pathlib import Path
-from dotenv import load_dotenv
-load_dotenv(Path(__file__).parent / ".env")
+
+INSTALL_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ---- Auto-detect and add venv to path ----
+# This allows the script to work without manually activating the venv
+venv_path = os.path.join(INSTALL_DIR, "venv", "lib")
+if os.path.isdir(venv_path):
+    # Find the actual site-packages (handles different Python versions)
+    for entry in os.listdir(venv_path):
+        sp = os.path.join(venv_path, entry, "site-packages")
+        if os.path.isdir(sp):
+            sys.path.insert(0, sp)
+            break
+
+# Load .env
+env_file = os.path.join(INSTALL_DIR, ".env")
+if os.path.isfile(env_file):
+    with open(env_file) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip())
+
 from openai import OpenAI
 
-API_KEY = os.environ["DEEPSEEK_API_KEY"]
+API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
 MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+
+if not API_KEY:
+    print("Error: DEEPSEEK_API_KEY not set in", env_file)
+    sys.exit(1)
 
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
@@ -498,6 +528,41 @@ if __name__ == "__main__":
     main()
 CLI_PY
 chmod +x "$INSTALL_DIR/ai"
+
+# 全局软链接（使用 venv 内的 Python 解释器）
+ln -sf "$INSTALL_DIR/ai" /usr/local/bin/ai 2>/dev/null || true
+
+# --- claude 别名（通过代理调用 DeepSeek）---
+cat > "$INSTALL_DIR/claude" << 'CLAUDE_SH'
+#!/bin/bash
+# Claude CLI 替代：通过本地代理调用 DeepSeek API
+# 用法: claude "你的问题"
+INSTALL_DIR="/root/ai-assistant"
+PROXY_URL="${CLAUDE_BASE_URL:-http://localhost:8000}/v1/chat/completions"
+
+prompt="${*:-Hello}"
+curl -s "$PROXY_URL" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\": \"deepseek-chat\",
+    \"messages\": [
+      {\"role\": \"system\", \"content\": \"你是一个AI编程助手，请简洁准确地回答问题。\"},
+      {\"role\": \"user\", \"content\": \"$prompt\"}
+    ],
+    \"temperature\": 0.3,
+    \"max_tokens\": 4096
+  }" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    print(data['choices'][0]['message']['content'])
+except Exception as e:
+    print(f'Error: {e}')
+    print(sys.stdin.read()[:500])
+" 2>/dev/null
+CLAUDE_SH
+chmod +x "$INSTALL_DIR/claude"
+ln -sf "$INSTALL_DIR/claude" /usr/local/bin/claude 2>/dev/null || true
 
 # ── Step 6: 启动服务（容器兼容模式）─────────────────────────────────
 log "Step 6/6: 启动服务 ..."
@@ -575,7 +640,9 @@ log ""
 log "  Web UI:     http://localhost:${WEB_PORT}"
 log "    在 AutoDL 中: 点击「自定义服务」查看外网地址"
 log ""
-log "  CLI 工具:   ai '你的问题'"
+log "  CLI 工具:"
+log "    ai '你的问题'          # AI 编程助手"
+log "    claude '你的问题'       # Claude 风格（通过代理）"
 log ""
 log "  管理命令:"
 log "    bash $INSTALL_DIR/status.sh     # 查看状态"
