@@ -80,10 +80,33 @@ echo "  CUDA: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null ||
 # 确保基础包
 pip3 install --quiet --upgrade pip setuptools wheel 2>/dev/null || true
 
-# ── Step 2: 创建虚拟环境 ────────────────────────────────────────────
-log "Step 2/6: 创建 Python 虚拟环境 ..."
-python3 -m venv "$VENV_DIR" || err "创建虚拟环境失败，请检查 Python 安装"
-source "$VENV_DIR/bin/activate"
+# ── Step 2: 创建 Python 环境 ────────────────────────────────────────
+log "Step 2/6: 配置 Python 环境 ..."
+
+PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+log "当前 Python: $PY_VER"
+
+# Python 3.10+ 直接创建 venv
+if python3 -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null; then
+    python3 -m venv "$VENV_DIR" || err "创建虚拟环境失败"
+    source "$VENV_DIR/bin/activate"
+
+# 如果有 conda（AutoDL 标配），用 conda 创建 Python 3.10 环境
+elif command -v conda &>/dev/null; then
+    log "Python 太旧，用 conda 创建 Python 3.10 环境 ..."
+    conda create -n ai-assistant python=3.10 -y 2>&1 | tail -3
+    # 激活 conda 环境并使用它的 python 建 venv
+    eval "$(conda shell.bash hook)"
+    conda activate ai-assistant
+    python3 -m venv "$VENV_DIR"
+    source "$VENV_DIR/bin/activate"
+
+# 都没有就报错
+else
+    err "需要 Python 3.10+，当前是 $PY_VER，且未找到 conda"
+fi
+
+log "虚拟环境: $VENV_DIR (Python $(python3 --version 2>&1))"
 
 # ── Step 3: 安装依赖 ────────────────────────────────────────────────
 log "Step 3/6: 安装依赖包 ..."
@@ -476,58 +499,69 @@ if __name__ == "__main__":
 CLI_PY
 chmod +x "$INSTALL_DIR/ai"
 
-# ── Step 6: 配置 systemd 服务 ───────────────────────────────────────
-log "Step 6/6: 配置自启动服务 ..."
+# ── Step 6: 启动服务（容器兼容模式）─────────────────────────────────
+log "Step 6/6: 启动服务 ..."
 
-cat > /etc/systemd/system/ai-proxy.service << EOF
-[Unit]
-Description=DeepSeek API Proxy Service
-After=network.target
+# AutoDL 容器没有 systemd，用 nohup + PID 文件替代
+# 先停掉旧进程
+if [ -f "$INSTALL_DIR/proxy.pid" ]; then
+    kill "$(cat "$INSTALL_DIR/proxy.pid")" 2>/dev/null || true
+fi
+if [ -f "$INSTALL_DIR/webui.pid" ]; then
+    kill "$(cat "$INSTALL_DIR/webui.pid")" 2>/dev/null || true
+fi
+sleep 1
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=$INSTALL_DIR
-Environment=PATH=$VENV_DIR/bin:/usr/local/bin:/usr/bin:/bin
-EnvironmentFile=$INSTALL_DIR/.env
-ExecStart=$VENV_DIR/bin/python $INSTALL_DIR/proxy_server.py
-Restart=always
-RestartSec=5
-StandardOutput=append:$LOG_DIR/proxy.log
-StandardError=append:$LOG_DIR/proxy.log
+# 启动 API Proxy
+nohup "$VENV_DIR/bin/python" "$INSTALL_DIR/proxy_server.py" \
+    > "$LOG_DIR/proxy.log" 2>&1 &
+echo $! > "$INSTALL_DIR/proxy.pid"
+log "API Proxy  启动 (PID: $(cat "$INSTALL_DIR/proxy.pid"))"
 
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > /etc/systemd/system/ai-webui.service << EOF
-[Unit]
-Description=AI Coding Assistant Web UI
-After=network.target ai-proxy.service
-Wants=ai-proxy.service
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=$INSTALL_DIR
-Environment=PATH=$VENV_DIR/bin:/usr/local/bin:/usr/bin:/bin
-EnvironmentFile=$INSTALL_DIR/.env
-ExecStart=$VENV_DIR/bin/python $INSTALL_DIR/web_ui.py
-Restart=always
-RestartSec=5
-StandardOutput=append:$LOG_DIR/webui.log
-StandardError=append:$LOG_DIR/webui.log
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable ai-proxy ai-webui
-systemctl start ai-proxy ai-webui
+# 启动 Web UI
+nohup "$VENV_DIR/bin/python" "$INSTALL_DIR/web_ui.py" \
+    > "$LOG_DIR/webui.log" 2>&1 &
+echo $! > "$INSTALL_DIR/webui.pid"
+log "Web UI    启动 (PID: $(cat "$INSTALL_DIR/webui.pid"))"
 
 # 创建 CLI 软链接
 ln -sf "$INSTALL_DIR/ai" /usr/local/bin/ai 2>/dev/null || true
+
+# 创建管理脚本
+cat > "$INSTALL_DIR/status.sh" << 'STATUS_SH'
+#!/bin/bash
+INSTALL_DIR="/root/ai-assistant"
+echo "=== AI 编程助手 服务状态 ==="
+for svc in proxy webui; do
+    pidfile="$INSTALL_DIR/${svc}.pid"
+    if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+        echo "  ${svc}: 运行中 (PID: $(cat "$pidfile"))"
+    else
+        echo "  ${svc}: 已停止"
+    fi
+done
+echo ""
+echo "日志: tail -f $INSTALL_DIR/logs/proxy.log"
+echo "重启: bash $INSTALL_DIR/restart.sh"
+STATUS_SH
+chmod +x "$INSTALL_DIR/status.sh"
+
+cat > "$INSTALL_DIR/restart.sh" << 'RESTART_SH'
+#!/bin/bash
+INSTALL_DIR="/root/ai-assistant"
+cd "$INSTALL_DIR"
+for svc in proxy webui; do
+    pidfile="$INSTALL_DIR/${svc}.pid"
+    [ -f "$pidfile" ] && kill "$(cat "$pidfile")" 2>/dev/null
+done
+sleep 1
+source venv/bin/activate
+nohup venv/bin/python proxy_server.py > logs/proxy.log 2>&1 & echo $! > proxy.pid
+nohup venv/bin/python web_ui.py > logs/webui.log 2>&1 & echo $! > webui.pid
+echo "服务已重启"
+bash status.sh
+RESTART_SH
+chmod +x "$INSTALL_DIR/restart.sh"
 
 # ── 验证部署 ────────────────────────────────────────────────────────
 log ""
@@ -542,14 +576,12 @@ log "  Web UI:     http://localhost:${WEB_PORT}"
 log "    在 AutoDL 中: 点击「自定义服务」查看外网地址"
 log ""
 log "  CLI 工具:   ai '你的问题'"
-log "    代码审查:  ai --review file.py"
-log "    代码解释:  ai --explain code.py"
 log ""
 log "  管理命令:"
-log "    systemctl status ai-proxy   # 查看代理状态"
-log "    systemctl status ai-webui   # 查看 Web UI 状态"
-log "    systemctl restart ai-proxy  # 重启代理"
-log "    journalctl -u ai-proxy -f   # 查看代理日志"
+log "    bash $INSTALL_DIR/status.sh     # 查看状态"
+log "    bash $INSTALL_DIR/restart.sh    # 重启服务"
+log "    tail -f $LOG_DIR/proxy.log      # 查看代理日志"
+log "    tail -f $LOG_DIR/webui.log      # 查看 Web UI 日志"
 log ""
 log "  API Key 配置: $INSTALL_DIR/.env"
 
