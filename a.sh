@@ -36,20 +36,33 @@ claude --version
 echo "[4/5] 配置 DeepSeek API ..."
 DS_KEY="sk-8b78a9e5ac8c4aa3bfd114e25a0cc458"
 
-# 避免重复写入
+# 直接写入 ~/.bashrc
 if ! grep -q "ANTHROPIC_BASE_URL" ~/.bashrc 2>/dev/null; then
-    cat >> ~/.bashrc << EOF
+    cat >> ~/.bashrc << 'ENVEOF'
 
 # === DeepSeek API (for Claude Code) ===
 export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
-export ANTHROPIC_AUTH_TOKEN="${DS_KEY}"
+export ANTHROPIC_API_KEY="DSKEY_PLACEHOLDER"
+export ANTHROPIC_AUTH_TOKEN="DSKEY_PLACEHOLDER"
 export ANTHROPIC_MODEL="deepseek-v4-flash"
-EOF
+ENVEOF
     echo "  已写入 ~/.bashrc"
 else
-    echo "  环境变量已存在，跳过"
+    echo "  配置已存在，跳过写入"
 fi
-source ~/.bashrc
+
+# 替换占位符
+sed -i "s/DSKEY_PLACEHOLDER/${DS_KEY}/g" ~/.bashrc
+
+# 当前 shell 直接 export（不用 source ~/.bashrc，避免 PS1 unbound 报错）
+export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
+export ANTHROPIC_API_KEY="${DS_KEY}"
+export ANTHROPIC_AUTH_TOKEN="${DS_KEY}"
+export ANTHROPIC_MODEL="deepseek-v4-flash"
+echo "  环境变量已生效:"
+echo "    BASE_URL=$ANTHROPIC_BASE_URL"
+echo "    MODEL=$ANTHROPIC_MODEL"
+echo "    KEY=${DS_KEY:0:12}..."
 
 # ---- 5. 测试连通性 ----
 echo "[5/5] 测试 DeepSeek V4 API ..."
