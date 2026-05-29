@@ -54,7 +54,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
 
 from config import (
-    MODEL_DIR, PROCESSED_DIR, DEVICE,
+    MODEL_DIR, PROCESSED_DIR, DEVICE, D_MODEL,
     BATCH_SIZE, N_EPOCHS, LR, WEIGHT_DECAY, GRAD_CLIP,
     LR_PATIENCE, EARLY_STOP_PATIENCE, VAL_RATIO, TEST_RATIO,
     LOOKBACK_DAYS, PREDICT_HORIZON, STEP_DAYS,

@@ -7,3 +7,7 @@ models/
 *.swp
 *.swo
 .DS_Store
+output/
+temp/
+result.csv
+.ipynb_checkpoints/
