@@ -13,7 +13,7 @@ echo "  Start: $(date '+%Y-%m-%d %H:%M:%S')"
 cd /app/code/src
 
 # ---- predict (5 min limit) ----
-timeout 300 python test.py \
+timeout 300 python3 test.py \
     --data /app/data/test.csv \
     --model-dir /app/model \
     --output /app/output/result.csv

@@ -171,8 +171,8 @@ def _precompute_arrays(panel, stock_ids, feature_cols, dates):
     didx = {d: i for i, d in enumerate(dates)}
 
     df = panel.reset_index()[["date", "stock_id", "open"] + feature_cols]
-    df["si"] = df["stock_id"].map(sidx).astype("Int32")
-    df["di"] = df["date"].map(didx).astype("Int32")
+    df["si"] = df["stock_id"].map(sidx).astype(np.int64)
+    df["di"] = df["date"].map(didx).astype(np.int64)
     df = df.dropna(subset=["si", "di"])
 
     feats = np.zeros((n_stocks, n_dates, nf), dtype=np.float32)

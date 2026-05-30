@@ -1,4 +1,11 @@
-"""Prediction script — reads test.csv, loads model, outputs result.csv."""
+"""Prediction script — reads test.csv, loads model, outputs result.csv.
+
+Weight allocation methods:
+  - equal:        1/N (baseline)
+  - softmax:      exp(score/T) / sum(exp(score/T))
+  - inv_vol:      1/vol / sum(1/vol)  (risk parity)
+  - score_vol:    score / vol  (return-risk balanced, recommended)
+"""
 
 from __future__ import annotations
 
@@ -10,7 +17,7 @@ import pandas as pd
 import torch
 
 from config import MODEL_DIR, OUTPUT_DIR, DEVICE, MAX_STOCKS, TOP_K_CANDIDATES
-from data_loader import load_panel_from_csv, load_test_csv
+from data_loader import load_panel_from_csv
 from featurework import engineer_features, make_window_samples
 from model import PortfolioPredictor
 
@@ -25,8 +32,8 @@ def select_diverse_portfolio(
     embeddings: torch.Tensor | None = None,
     max_stocks: int = MAX_STOCKS,
     top_k: int = TOP_K_CANDIDATES,
-) -> list[tuple[str, float]]:
-    """Greedy diverse top-K selection."""
+) -> list[int]:
+    """Greedy diverse top-K selection. Returns indices."""
     order = np.argsort(scores)[::-1]
     candidates = list(order[:min(top_k, len(order))])
 
@@ -47,9 +54,72 @@ def select_diverse_portfolio(
             candidates.remove(best_idx)
     else:
         selected = candidates[:max_stocks]
+    return selected
 
-    w = np.ones(len(selected)) / len(selected)
-    return [(stock_ids[i], float(w)) for i, w in zip(selected, w)]
+
+# ---------------------------------------------------------------------------
+# Weight allocation
+# ---------------------------------------------------------------------------
+
+def compute_weights(
+    method: str,
+    indices: list[int],
+    scores: np.ndarray,
+    panel: pd.DataFrame,
+    stock_ids: list[str],
+    temperature: float = 0.5,
+) -> np.ndarray:
+    """Allocate weights to selected stocks.
+
+    Methods:
+      equal     — 1/N, simplest
+      softmax   — score-based via softmax
+      inv_vol   — inverse volatility (risk parity)
+      score_vol — score / volatility (return-risk balanced, recommended)
+    """
+    k = len(indices)
+    if k == 0:
+        return np.array([])
+
+    if method == "equal":
+        return np.ones(k) / k
+
+    sel_scores = scores[indices]
+    sel_ids = [stock_ids[i] for i in indices]
+
+    if method == "softmax":
+        x = np.exp((sel_scores - sel_scores.max()) / temperature)
+        w = x / x.sum()
+
+    elif method == "inv_vol":
+        vols = _get_volatilities(sel_ids, panel)
+        inv = 1.0 / np.clip(vols, 0.005, None)
+        w = inv / inv.sum()
+
+    elif method == "score_vol":
+        vols = _get_volatilities(sel_ids, panel)
+        # score in [0, 1] range via min-max, then divide by vol
+        s_norm = (sel_scores - sel_scores.min()) / (sel_scores.max() - sel_scores.min() + 1e-9)
+        raw = s_norm / np.clip(vols, 0.005, None)
+        w = raw / raw.sum()
+
+    else:
+        w = np.ones(k) / k
+
+    return w
+
+
+def _get_volatilities(sel_ids: list[str], panel: pd.DataFrame) -> np.ndarray:
+    """Extract historical daily volatility for each selected stock."""
+    vols = []
+    for sid in sel_ids:
+        try:
+            sd = panel.xs(sid, level="stock_id")
+            vol = float((sd["pctChg"] / 100.0).std())
+        except Exception:
+            vol = 0.03  # default ~3% daily vol
+        vols.append(max(vol, 0.002))
+    return np.array(vols)
 
 
 # ---------------------------------------------------------------------------
@@ -105,12 +175,19 @@ def main():
     valid_n = int(mask[-1].sum())
     print(f"[test] Date: {dates[-1]}  Valid: {valid_n}/{len(stock_ids)}")
 
-    sel = select_diverse_portfolio(s, stock_ids, e)
+    # Select stocks
+    indices = select_diverse_portfolio(s, stock_ids, e)
+
+    # Allocate weights (score_vol = return-risk balanced)
+    w = compute_weights("score_vol", indices, s, panel, stock_ids)
+
+    sel = [(stock_ids[i], float(w[j])) for j, i in enumerate(indices)]
     df = pd.DataFrame(sel, columns=["stock_id", "weight"])
+    print(f"[test] Weights: " + ", ".join(f"{sid}={wt:.3f}" for sid, wt in sel))
+
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(args.output, index=False, encoding="utf-8")
     print(f"[test] -> {args.output}")
-    print(df.to_string(index=False))
 
 
 if __name__ == "__main__":

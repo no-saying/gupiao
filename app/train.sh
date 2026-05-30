@@ -13,7 +13,7 @@ echo "  Start: $(date '+%Y-%m-%d %H:%M:%S')"
 cd /app/code/src
 
 # ---- train ----
-python train.py \
+python3 train.py \
     --data /app/data/train.csv \
     --model-dir /app/model \
     --output /app/output/result.csv \
