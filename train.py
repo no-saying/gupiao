@@ -1,73 +1,36 @@
-"""
-=============================================================================
-  训练脚本 —— 端到端的模型训练与回测验证
-=============================================================================
+"""Training script for the attention-based stock ranking model."""
 
-训练流程概览：
+from __future__ import annotations
 
-  1. 数据获取       fetch_csi300_stocks() + build_panel()
-     ↓
-  2. 特征工程       engineer_features() → 22 个因子
-     ↓
-  3. 构造样本       make_window_samples() → (X, y, mask) 张量
-     ↓
-  4. 数据划分       按时间顺序切分 train/val/test
-     ↓
-  5. 模型训练       LambdaRank loss + AdamW + ReduceLROnPlateau
-     ↓
-  6. 模型验证       验证集指标 + Early Stopping
-     ↓
-  7. 回测评估       在测试集上模拟 top-5 等权组合的收益
-     ↓
-  8. 模型保存       保存权重 + 配置到 models/
-
-关键设计决策：
-
-  - 时间序列必须按时间切分（不能用 shuffle split）
-    避免用"未来"数据预测"过去"（data leakage）
-
-  - 验证集和测试集都按时间切分在最近的数据上
-    因为市场环境随时间变化，在最近的数据上验证更有意义
-
-  - 回测模拟真实交易：
-    买 T+1 开盘价，卖 T+5 开盘价，手续费未考虑（按赛题要求）
-
-使用方法：
-  python train.py                     # 默认配置训练
-  python train.py --loss pairwise     # 用 pairwise hinge loss
-  python train.py --epochs 200        # 自定义训练轮数
-  python train.py --lr 5e-5           # 自定义学习率
-  python train.py --download          # 强制重新下载数据
-
-=============================================================================
-"""
-
-import os
-import argparse
-import pickle
+import argparse, pickle, shutil
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import torch
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 from config import (
-    MODEL_DIR, PROCESSED_DIR, DEVICE, D_MODEL,
+    MODEL_DIR, PROCESSED_DIR, RAW_DIR, DEVICE, D_MODEL,
     BATCH_SIZE, N_EPOCHS, LR, WEIGHT_DECAY, GRAD_CLIP,
     LR_PATIENCE, EARLY_STOP_PATIENCE, VAL_RATIO, TEST_RATIO,
-    LOOKBACK_DAYS, PREDICT_HORIZON, STEP_DAYS,
-    MAX_STOCKS, TOP_K_CANDIDATES, TEMPERATURE,
+    MAX_STOCKS, START_DATE, END_DATE,
 )
 from data_loader import fetch_csi300_stocks, build_panel
-from features import engineer_features, make_window_samples, get_norm_stats
-from model import PortfolioPredictor, lambdarank_loss, pairwise_ranking_loss, listnet_loss, topk_listnet_loss
+from features import engineer_features, make_window_samples
+from model import PortfolioPredictor, listnet_loss, lambdarank_loss, pairwise_ranking_loss
 
 
-# =============================================================================
-# 数据加载器创建：按时间顺序切分
-# =============================================================================
+LOSS_FN = {
+    "listnet": listnet_loss,
+    "lambdarank": lambdarank_loss,
+    "pairwise": pairwise_ranking_loss,
+}
+
+
+# ---------------------------------------------------------------------------
+# Data split
+# ---------------------------------------------------------------------------
 
 def make_dataloaders(
     X: np.ndarray, y: np.ndarray, mask: np.ndarray,
@@ -75,477 +38,178 @@ def make_dataloaders(
     val_ratio: float = VAL_RATIO,
     test_ratio: float = TEST_RATIO,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
-    """
-    将样本按时间顺序切分为训练集、验证集、测试集。
-
-    为什么不能用随机切分？
-      时间序列数据中，相邻样本高度相关。
-      如果随机切分，模型可能在"见过类似样本"的验证集上表现好，
-      但在真正的新时间点上表现差。这就是数据泄露（data leakage）。
-
-    切分方式：
-      假设有 1000 个样本（按时间排序）：
-        test_start = 900 (后 10%)
-        val_start  = 750 (后 15% + 10%)
-
-        训练集:    [0, 750)   ← 最早的数据
-        验证集:    [750, 900) ← 中间
-        测试集:    [900, 1000] ← 最新（用于最终评估）
-
-    训练集做 shuffle=True 增加随机性，验证/测试集不做 shuffle。
-    """
+    """Chronological train/val/test split."""
     n = len(X)
-    test_start = int(n * (1 - test_ratio))                     # 测试集起始位置
-    val_start = int(n * (1 - test_ratio - val_ratio))          # 验证集起始位置
+    ts = int(n * (1 - test_ratio))
+    vs = int(n * (1 - test_ratio - val_ratio))
 
-    X_train, y_train, m_train = X[:val_start], y[:val_start], mask[:val_start]
-    X_val,   y_val,   m_val   = X[val_start:test_start], y[val_start:test_start], mask[val_start:test_start]
-    X_test,  y_test,  m_test  = X[test_start:], y[test_start:], mask[test_start:]
+    def _dl(a, b, c, shuffle=False):
+        ds = TensorDataset(torch.from_numpy(a), torch.from_numpy(b), torch.from_numpy(c))
+        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle)
 
-    def to_loader(Xa, ya, ma, shuffle=False):
-        """辅助函数：numpy → TensorDataset → DataLoader"""
-        ds = TensorDataset(
-            torch.from_numpy(Xa),
-            torch.from_numpy(ya),
-            torch.from_numpy(ma),
-        )
-        return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
-
-    print(f"[train] Split: train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
-
-    # 训练集 shuffle=True: 每个 epoch 看到不同顺序的数据，防止模型记住顺序
-    return to_loader(X_train, y_train, m_train, shuffle=True), \
-           to_loader(X_val,   y_val,   m_val),                   \
-           to_loader(X_test,  y_test,  m_test)
+    t = _dl(X[:vs], y[:vs], mask[:vs], shuffle=True)
+    v = _dl(X[vs:ts], y[vs:ts], mask[vs:ts])
+    s = _dl(X[ts:], y[ts:], mask[ts:])
+    print(f"[train] Split: {len(t.dataset)} / {len(v.dataset)} / {len(s.dataset)}")
+    return t, v, s
 
 
-# =============================================================================
-# 验证/测试评估
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
 
-def evaluate(model: PortfolioPredictor, loader: DataLoader, loss_fn) -> dict:
-    """
-    在验证集或测试集上计算损失和排序准确率。
-
-    Pairwise Accuracy（排序准确率）：
-      对所有有效 pair (i, j)，判断模型给出的排序方向是否正确。
-      如果 r_i > r_j 且 s_i > s_j → 正确
-      如果 r_i > r_j 但 s_i < s_j → 错误
-
-      这比 MSE 等回归指标更能反映模型的实际效果，
-      因为我们最终只需要选出排名靠前的股票。
-    """
+@torch.no_grad()
+def evaluate(model: PortfolioPredictor, loader: DataLoader, loss_fn) -> dict[str, float]:
     model.eval()
-    total_loss = 0.0
-    total_correct_pairs = 0.0
+    total_loss, correct, total = 0.0, 0.0, 0.0
     n_samples = 0
-    n_pairs = 0
 
-    with torch.no_grad():                                     # 不计算梯度，节省内存
-        for Xb, yb, mb in loader:
-            Xb, yb, mb = Xb.to(DEVICE), yb.to(DEVICE), mb.to(DEVICE)
-            scores, _ = model(Xb, mb)                         # 前向传播
-            loss = loss_fn(scores, yb, mb)                    # 带 mask 的排序损失
-            total_loss += loss.item() * Xb.size(0)
-            n_samples += Xb.size(0)
+    for xb, yb, mb in loader:
+        xb, yb, mb = xb.to(DEVICE), yb.to(DEVICE), mb.to(DEVICE)
+        scores, _ = model(xb, mb)
+        total_loss += loss_fn(scores, yb, mb).item() * xb.size(0)
+        n_samples += xb.size(0)
 
-            # ---- 计算 pairwise accuracy（逐样本） ----
-            for i in range(Xb.size(0)):
-                s, t, m = scores[i], yb[i], mb[i]            # 单个样本
-                valid_idx = (m > 0.5).nonzero(as_tuple=True)[0]
-                if len(valid_idx) < 2:
-                    continue
+        for i in range(xb.size(0)):
+            vi = (mb[i] > 0.5).nonzero(as_tuple=True)[0]
+            if len(vi) < 2:
+                continue
+            sv, tv = scores[i][vi], yb[i][vi]
+            sd = sv.unsqueeze(1) - sv.unsqueeze(0)
+            td = tv.unsqueeze(1) - tv.unsqueeze(0)
+            ok = (torch.sign(sd) == torch.sign(td)).float()
+            vp = (td.abs() > 1e-6).float()
+            correct += (ok * vp).sum().item()
+            total += vp.sum().item()
 
-                # 只考虑有效股票之间的 pair
-                s_v, t_v = s[valid_idx], t[valid_idx]
-                score_diff = s_v.unsqueeze(1) - s_v.unsqueeze(0)     # (V, V)
-                target_diff = t_v.unsqueeze(1) - t_v.unsqueeze(0)    # (V, V)
+    return {"loss": total_loss / max(n_samples, 1), "pair_acc": correct / max(total, 1)}
 
-                # sign(score_diff) == sign(target_diff) → 排序方向正确
-                correct = (torch.sign(score_diff) == torch.sign(target_diff)).float()
 
-                # 排除 target 完全相等的 pair
-                valid_pair = (target_diff.abs() > 1e-6).float()
-                total_correct_pairs += (correct * valid_pair).sum().item()
-                n_pairs += valid_pair.sum().item()
+def _portfolio_ret(scores, y_true, mask_vec, k=MAX_STOCKS):
+    vi = np.where(mask_vec > 0.5)[0]
+    if len(vi) == 0:
+        return 0.0
+    top = vi[np.argsort(scores[vi])[::-1][:min(k, len(vi))]]
+    return float(np.mean(y_true[top]))
 
+
+@torch.no_grad()
+def backtest(model: PortfolioPredictor, loader: DataLoader) -> dict[str, float]:
+    model.eval()
+    rets = []
+    for xb, yb, mb in loader:
+        scores, _ = model(xb.to(DEVICE), mb.to(DEVICE))
+        for i in range(len(xb)):
+            rets.append(_portfolio_ret(scores[i].cpu().numpy(), yb[i].numpy(), mb[i].numpy()))
+    arr = np.array(rets)
     return {
-        "loss": total_loss / max(n_samples, 1),
-        "pair_accuracy": total_correct_pairs / max(n_pairs, 1),
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "sharpe": float(np.mean(arr) / (np.std(arr) + 1e-9)),
+        "win_rate": float((arr > 0).mean()),
+        "n": len(arr),
     }
 
 
-# =============================================================================
-# 单轮训练
-# =============================================================================
-
-def labels_to_ranks(y: torch.Tensor, mask: torch.Tensor, gaussian: bool = True) -> torch.Tensor:
-    """
-    将原始收益率转换为排名分数（用于 ListNet 训练）。
-
-    模式：
-      gaussian=True:  百分位数 → 高斯分位数（z-score），尾部更突出
-      gaussian=False: 百分位数（0~1 均匀分布）
-
-    为什么 Gaussian 可能更好？
-      百分位数线性均匀分布，但 top-5 选股关注头部。
-      高斯变换让 top 5% 的股票获得更大的概率质量。
-    """
-    B, N = y.shape
-    ranks = y.clone()
-    for i in range(B):
-        valid_idx = (mask[i] > 0.5).nonzero(as_tuple=True)[0]
-        n_valid = len(valid_idx)
-        if n_valid < 2:
-            ranks[i] = -float("inf")
-            continue
-        valid_vals = y[i, valid_idx]
-        sorted_idx = valid_vals.argsort()
-        # 百分位数 [0, 1]
-        percentile = torch.zeros(n_valid, device=y.device)
-        percentile[sorted_idx] = torch.arange(n_valid, device=y.device).float() / (n_valid - 1)
-        # 可选：高斯分位数（尾部拉伸）
-        if gaussian and n_valid > 2:
-            from torch.distributions import Normal
-            # 将 [0,1] → [-0.999, 0.999] → 高斯分位数
-            clipped = percentile.clamp(0.001, 0.999)
-            normal = Normal(0.0, 1.0)
-            ranks[i, valid_idx] = normal.icdf(clipped)  # z-score
-        else:
-            ranks[i, valid_idx] = percentile
-        ranks[i, ~((mask[i] > 0.5))] = -float("inf")
-    return ranks
-
-
-def train_epoch(model, loader, optimizer, loss_fn, epoch: int, use_rank_labels: bool = False) -> float:
-    """
-    执行一个 epoch 的训练。
-
-    每个 epoch 遍历全部训练样本一次，更新模型参数。
-
-    使用梯度裁剪 (Gradient Clipping) 防止梯度爆炸：
-      当梯度的 L2 范数超过阈值 (GRAD_CLIP=1.0) 时，
-      等比例缩小所有梯度，避免参数更新过大。
-      这对 RNN/Transformer 模型在长序列上尤其重要。
-    """
-    model.train()
-    total_loss = 0.0
-    n_batches = 0
-
-    pbar = tqdm(loader, desc=f"Epoch {epoch:3d}")
-    for Xb, yb, mb in pbar:
-        Xb, yb, mb = Xb.to(DEVICE), yb.to(DEVICE), mb.to(DEVICE)
-
-        # 标签转换（可选：收益率 → 百分位数排名）
-        yb_target = labels_to_ranks(yb, mb) if use_rank_labels else yb
-
-        # 标准训练循环
-        optimizer.zero_grad()                                 # 清空梯度累积
-        scores, _ = model(Xb, mb)                             # 前向传播
-        loss = loss_fn(scores, yb_target, mb)                 # 计算损失
-        loss.backward()                                       # 反向传播（计算梯度）
-        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)  # 梯度裁剪
-        optimizer.step()                                      # 更新参数
-
-        total_loss += loss.item()
-        n_batches += 1
-        pbar.set_postfix(loss=f"{total_loss / n_batches:.4f}")
-
-    return total_loss / max(n_batches, 1)
-
-
-# =============================================================================
-# 完整训练流程
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Training
+# ---------------------------------------------------------------------------
 
 def train_model(
-    model: PortfolioPredictor,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    epochs: int = N_EPOCHS,
-    lr: float = LR,
-    weight_decay: float = WEIGHT_DECAY,
-    loss_name: str = "lambdarank",
-    use_rank_labels: bool = False,
+    model, train_loader, val_loader,
+    epochs=N_EPOCHS, lr=LR, wd=WEIGHT_DECAY, loss_name="listnet",
 ) -> PortfolioPredictor:
-    """
-    完整训练循环，包含：
-      1. AdamW 优化器（带解耦权重衰减，比 Adam 更好的泛化能力）
-      2. ReduceLROnPlateau 学习率调度（验证损失不降时自动减半学习率）
-      3. Early Stopping（验证损失连续 N 轮不降则停止）
-      4. Best Model Checkpointing（始终保存验证集上最优的权重）
-    """
     model = model.to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    sch = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=LR_PATIENCE)
+    loss_fn = LOSS_FN[loss_name]
 
-    # AdamW: Adam + 解耦的 L2 正则化
-    # 相比 Adam，AdamW 的权重衰减直接作用在参数上而非梯度上，效果更好
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    best_loss = float("inf")
+    best_w: dict | None = None
+    patience = 0
 
-    # ReduceLROnPlateau: 验证损失 plateau 时自动降低学习率
-    # factor=0.5 → 减半, patience=10 → 等 10 个 epoch
-    # 这是训练深度模型常用的技巧：先用大学习率快速收敛，再减小学习率精调
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=LR_PATIENCE, verbose=True,
-    )
+    for ep in range(1, epochs + 1):
+        model.train()
+        tl = 0.0
+        pbar = tqdm(train_loader, desc=f"Epoch {ep:3d}")
+        for xb, yb, mb in pbar:
+            xb, yb, mb = xb.to(DEVICE), yb.to(DEVICE), mb.to(DEVICE)
+            opt.zero_grad()
+            scores, _ = model(xb, mb)
+            loss = loss_fn(scores, yb, mb)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            opt.step()
+            tl += loss.item()
+            pbar.set_postfix(loss=f"{tl / max(pbar.n, 1):.4f}")
 
-    # 选择损失函数
-    loss_map = {
-        "lambdarank": lambdarank_loss,
-        "pairwise": pairwise_ranking_loss,
-        "listnet": listnet_loss,
-        "topk_listnet": topk_listnet_loss,
-    }
-    loss_fn = loss_map.get(loss_name, listnet_loss)
+        vm = evaluate(model, val_loader, loss_fn)
+        print(f"  train={tl/len(train_loader):.4f}  val={vm['loss']:.4f}  pair_acc={vm['pair_acc']:.3f}")
+        sch.step(vm["loss"])
 
-    best_val_loss = float("inf")
-    best_weights = None
-    patience_counter = 0
-
-    for epoch in range(1, epochs + 1):
-        # ---- 训练 ----
-        train_loss = train_epoch(model, train_loader, optimizer, loss_fn, epoch,
-                                 use_rank_labels=use_rank_labels)
-
-        # ---- 验证 ----
-        val_metrics = evaluate(model, val_loader, loss_fn)
-        print(f"  train_loss={train_loss:.4f}  "
-              f"val_loss={val_metrics['loss']:.4f}  "
-              f"val_pair_acc={val_metrics['pair_accuracy']:.3f}")
-
-        # ---- 学习率调度 ----
-        scheduler.step(val_metrics["loss"])
-
-        # ---- 模型保存 & Early Stopping ----
-        # 使用容差避免浮点抖动导致的虚假 "best model"
-        if val_metrics["loss"] < best_val_loss - 1e-7:
-            best_val_loss = val_metrics["loss"]
-            best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
-            print(f"  → New best model (val_loss={best_val_loss:.4f})")
+        if vm["loss"] < best_loss:
+            best_loss = vm["loss"]
+            best_w = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience = 0
         else:
-            patience_counter += 1
-            if patience_counter >= EARLY_STOP_PATIENCE:
-                print(f"  Early stopping at epoch {epoch}")
+            patience += 1
+            if patience >= EARLY_STOP_PATIENCE:
+                print(f"  Early stop at {ep}")
                 break
 
-    # 恢复最优权重（如果从未更新过，直接用当前权重）
-    if best_weights is not None:
-        model.load_state_dict(best_weights)
-    else:
-        print("  WARNING: No improvement found, using final weights")
+    model.load_state_dict(best_w)
     return model
 
 
-# =============================================================================
-# 回测：模拟交易评估模型效果
-# =============================================================================
-
-def portfolio_return(
-    scores: np.ndarray,
-    true_returns: np.ndarray,
-    stock_mask: np.ndarray,
-    max_stocks: int = MAX_STOCKS,
-) -> float:
-    """
-    给定一个样本的预测分数和真实收益，计算 top-K 等权组合的实际收益。
-
-    模拟过程：
-      1. 找出模型评分最高的 K 只有效股票
-      2. 等权分配（每只 1/K）
-      3. 组合收益 = 各股票真实收益的平均值
-
-    注意：这里用"真实收益"是回测——假设我们在 T+1 开盘买入、T+5 开盘卖出，
-    用事后知道的收益率来评估决策质量。
-
-    等权 vs 加权：
-      对于 top-5 的选股问题，等权通常已经足够好，
-      因为入选的股票已经是模型最看好的，权重微调带来的提升有限。
-    """
-    valid_idx = np.where(stock_mask > 0.5)[0]                 # 只考虑有效股票
-
-    valid_scores = scores[valid_idx]
-    valid_returns = true_returns[valid_idx]
-
-    k = min(max_stocks, len(valid_scores))
-    if k == 0:
-        return 0.0
-
-    # argsort 默认升序，取 [-k:] 得到最高的 k 个
-    top_k_local = np.argsort(valid_scores)[-k:]
-    selected_returns = valid_returns[top_k_local]
-
-    return float(np.mean(selected_returns))
-
-
-def backtest(model: PortfolioPredictor, loader: DataLoader) -> dict:
-    """
-    在测试集上做完整回测。
-
-    对测试集中每个时间窗口：
-      1. 用模型给所有股票打分
-      2. 选 top-5 等权持有
-      3. 记录实际收益
-
-    汇总统输出：
-      - mean_return  : 平均每周收益率
-      - std_return   : 收益的标准差
-      - sharpe       : 周度夏普比率（简化版，无风险利率假设为 0）
-      - win_rate     : 正收益的比例（>50% 说明多数时候赚钱）
-    """
-    model.eval()
-    portfolio_returns = []
-
-    with torch.no_grad():
-        for Xb, yb, mb in loader:
-            Xb = Xb.to(DEVICE)
-            scores, _ = model(Xb, mb.to(DEVICE))
-            scores = scores.cpu().numpy()
-            yb = yb.cpu().numpy()
-            mb = mb.cpu().numpy()
-
-            for i in range(len(scores)):
-                ret = portfolio_return(scores[i], yb[i], mb[i])
-                portfolio_returns.append(ret)
-
-    arr = np.array(portfolio_returns)
-    return {
-        "mean_return": float(np.mean(arr)),
-        "std_return": float(np.std(arr)),
-        "sharpe": float(np.mean(arr) / (np.std(arr) + 1e-9)),  # +1e-9 防止除零
-        "win_rate": float((arr > 0).mean()),
-        "n_samples": len(arr),
-    }
-
-
-# =============================================================================
-# 主入口
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="训练基于注意力机制的股票组合预测模型"
-    )
-    parser.add_argument("--download", action="store_true",
-                        help="强制重新下载所有数据（清除缓存）")
-    parser.add_argument("--epochs", type=int, default=N_EPOCHS,
-                        help=f"训练轮数（默认: {N_EPOCHS}）")
-    parser.add_argument("--loss", choices=["lambdarank", "pairwise", "listnet", "topk_listnet"],
-                        default="listnet",
-                        help="损失函数: lambdarank/pairwise/listnet(推荐)/topk_listnet")
-    parser.add_argument("--lr", type=float, default=LR,
-                        help=f"学习率（默认: {LR}）")
-    parser.add_argument("--rank-labels", action="store_true",
-                        help="将收益率转为百分位数排名作为训练目标（推荐用于 listnet）")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--epochs", type=int, default=N_EPOCHS)
+    p.add_argument("--loss", choices=list(LOSS_FN), default="listnet")
+    p.add_argument("--lr", type=float, default=LR)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--download", action="store_true")
+    p.add_argument("--output", type=str, default=str(MODEL_DIR / "portfolio_model.pt"))
+    args = p.parse_args()
 
-    # ---- 可选：强制重新下载 ----
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
     if args.download:
-        import shutil
-        from config import RAW_DIR
         shutil.rmtree(RAW_DIR, ignore_errors=True)
         RAW_DIR.mkdir(exist_ok=True)
-        print("[train] Cleared data cache, will re-download.")
 
-    # ==================================================================
-    # Step 1-2: 数据获取（沪深300 + 中证500 = ~800 只股票）
-    # ==================================================================
     print("=" * 60)
-    print("Step 1: Fetch CSI 300 stocks")
-    stock_ids = fetch_csi300_stocks()
-    panel = build_panel(stock_ids)
+    stocks = fetch_csi300_stocks()
+    panel = build_panel(stocks, START_DATE, END_DATE)
+    panel = engineer_features(panel, stocks)
 
-    # ==================================================================
-    # Step 2: 特征工程
-    # ==================================================================
-    print("\nStep 2: Feature engineering")
-    panel = engineer_features(panel, stock_ids)
+    X, y, mask, dates = make_window_samples(panel, stocks)
+    nf = X.shape[-1]
+    print(f"  X={X.shape}  features={nf}")
 
-    # ==================================================================
-    # Step 3: 构造训练样本
-    # ==================================================================
-    print("\nStep 3: Build training windows")
-
-    # 从 Panel 中动态提取特征列名（跨市场指数特征在 engineer_features 中添加）
-    EXCLUDE_COLS = {"open", "high", "low", "close", "preclose", "volume",
-                    "amount", "adjustflag", "turn", "tradestatus",
-                    "pctChg", "peTTM", "pbMRQ", "market_ret",
-                    "stock_id", "index_name", "vol_ma5", "vol_ma20",
-                    "turn_ma5", "turn_ma20"}
-    feature_cols = [c for c in panel.columns if c not in EXCLUDE_COLS]
-
-    X, y, mask, dates = make_window_samples(panel, stock_ids)
-    n_features = X.shape[-1]
-    print(f"  X: {X.shape}, y: {y.shape}, mask: {mask.shape}")
-    print(f"  Feature cols ({len(feature_cols)}): {feature_cols[:8]}... +{len(feature_cols)-8} more")
-
-    # 缓存处理后的数据（predict.py 可以直接加载）
-    processed = {"X": X, "y": y, "mask": mask,
-                 "dates": dates, "stock_ids": stock_ids}
     with open(PROCESSED_DIR / "samples.pkl", "wb") as f:
-        pickle.dump(processed, f)
-    print(f"  Cached to {PROCESSED_DIR / 'samples.pkl'}")
+        pickle.dump({"X": X, "y": y, "mask": mask, "dates": dates, "stock_ids": stocks}, f)
 
-    # ==================================================================
-    # Step 5: 划分数据 & 训练
-    # ==================================================================
-    print("\n" + "=" * 60)
-    print("Step 4: Training")
-    train_loader, val_loader, test_loader = make_dataloaders(X, y, mask)
+    tl, vl, sl = make_dataloaders(X, y, mask)
+    model = PortfolioPredictor(n_features=nf)
+    print(f"  Params: {sum(p.numel() for p in model.parameters()):,}  Device: {DEVICE}")
 
-    model = PortfolioPredictor(n_features=n_features)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"  Model params: {n_params:,}")
-    print(f"  Device: {DEVICE}")
-    print(f"  Loss: {args.loss}")
+    model = train_model(model, tl, vl, epochs=args.epochs, lr=args.lr, loss_name=args.loss)
+    tm = evaluate(model, sl, LOSS_FN[args.loss])
+    bt = backtest(model, sl)
+    print(f"\n  Test: loss={tm['loss']:.4f}  pair_acc={tm['pair_acc']:.3f}")
+    print(f"  Backtest: mean={bt['mean']:+.6f}  sharpe={bt['sharpe']:+.4f}  win={bt['win_rate']:.1%}")
 
-    model = train_model(
-        model, train_loader, val_loader,
-        epochs=args.epochs, lr=args.lr, loss_name=args.loss,
-        use_rank_labels=args.rank_labels,
-    )
-
-    # ==================================================================
-    # Step 6: 评估 & 回测
-    # ==================================================================
-    print("\n" + "=" * 60)
-    print("Step 5: Evaluation")
-
-    # 测试集指标
-    test_metrics = evaluate(model, test_loader, lambdarank_loss)
-    print(f"  Test loss:        {test_metrics['loss']:.4f}")
-    print(f"  Test pair acc:    {test_metrics['pair_accuracy']:.3f} "
-          f"(random=0.500, perfect=1.000)")
-
-    # 模拟交易回测
-    bt = backtest(model, test_loader)
-    print(f"\n  ── Backtest (top-{MAX_STOCKS} equal-weight) ──")
-    print(f"  Mean weekly return:  {bt['mean_return']:.6f} "
-          f"({'POSITIVE' if bt['mean_return'] > 0 else 'NEGATIVE'})")
-    print(f"  Std weekly return:   {bt['std_return']:.6f}")
-    print(f"  Weekly Sharpe:       {bt['sharpe']:.4f}")
-    print(f"  Win rate:            {bt['win_rate']:.3f} "
-          f"({bt['win_rate']*100:.1f}% weeks profitable)")
-    print(f"  Test samples:        {bt['n_samples']}")
-
-    # ==================================================================
-    # Step 7: 保存模型
-    # ==================================================================
-    model_path = MODEL_DIR / "portfolio_model.pt"
-    norm_stats = get_norm_stats()
-    feat_mean = np.array(norm_stats[0]) if norm_stats is not None else None
-    feat_std  = np.array(norm_stats[1]) if norm_stats is not None else None
     torch.save({
         "model_state_dict": model.state_dict(),
-        "feature_cols": feature_cols,
-        "stock_ids": stock_ids,
-        "feat_mean": feat_mean,
-        "feat_std": feat_std,
-        "config": {
-            "n_features": n_features,
-            "d_model": D_MODEL,
-        },
-    }, model_path)
-    print(f"\n  Model saved to {model_path}")
+        "stock_ids": stocks,
+        "config": {"n_features": nf, "d_model": D_MODEL},
+    }, args.output)
+    print(f"  Saved to {args.output}")
 
 
 if __name__ == "__main__":
