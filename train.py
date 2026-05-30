@@ -54,7 +54,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
 
 from config import (
-    MODEL_DIR, PROCESSED_DIR, DEVICE,
+    MODEL_DIR, PROCESSED_DIR, DEVICE, D_MODEL,
     BATCH_SIZE, N_EPOCHS, LR, WEIGHT_DECAY, GRAD_CLIP,
     LR_PATIENCE, EARLY_STOP_PATIENCE, VAL_RATIO, TEST_RATIO,
     LOOKBACK_DAYS, PREDICT_HORIZON, STEP_DAYS,
@@ -62,7 +62,7 @@ from config import (
 )
 from data_loader import fetch_csi300_stocks, build_panel
 from features import engineer_features, make_window_samples, get_norm_stats
-from model import PortfolioPredictor, lambdarank_loss, pairwise_ranking_loss
+from model import PortfolioPredictor, lambdarank_loss, pairwise_ranking_loss, listnet_loss, topk_listnet_loss
 
 
 # =============================================================================
@@ -179,7 +179,45 @@ def evaluate(model: PortfolioPredictor, loader: DataLoader, loss_fn) -> dict:
 # 单轮训练
 # =============================================================================
 
-def train_epoch(model, loader, optimizer, loss_fn, epoch: int) -> float:
+def labels_to_ranks(y: torch.Tensor, mask: torch.Tensor, gaussian: bool = True) -> torch.Tensor:
+    """
+    将原始收益率转换为排名分数（用于 ListNet 训练）。
+
+    模式：
+      gaussian=True:  百分位数 → 高斯分位数（z-score），尾部更突出
+      gaussian=False: 百分位数（0~1 均匀分布）
+
+    为什么 Gaussian 可能更好？
+      百分位数线性均匀分布，但 top-5 选股关注头部。
+      高斯变换让 top 5% 的股票获得更大的概率质量。
+    """
+    B, N = y.shape
+    ranks = y.clone()
+    for i in range(B):
+        valid_idx = (mask[i] > 0.5).nonzero(as_tuple=True)[0]
+        n_valid = len(valid_idx)
+        if n_valid < 2:
+            ranks[i] = -float("inf")
+            continue
+        valid_vals = y[i, valid_idx]
+        sorted_idx = valid_vals.argsort()
+        # 百分位数 [0, 1]
+        percentile = torch.zeros(n_valid, device=y.device)
+        percentile[sorted_idx] = torch.arange(n_valid, device=y.device).float() / (n_valid - 1)
+        # 可选：高斯分位数（尾部拉伸）
+        if gaussian and n_valid > 2:
+            from torch.distributions import Normal
+            # 将 [0,1] → [-0.999, 0.999] → 高斯分位数
+            clipped = percentile.clamp(0.001, 0.999)
+            normal = Normal(0.0, 1.0)
+            ranks[i, valid_idx] = normal.icdf(clipped)  # z-score
+        else:
+            ranks[i, valid_idx] = percentile
+        ranks[i, ~((mask[i] > 0.5))] = -float("inf")
+    return ranks
+
+
+def train_epoch(model, loader, optimizer, loss_fn, epoch: int, use_rank_labels: bool = False) -> float:
     """
     执行一个 epoch 的训练。
 
@@ -198,10 +236,13 @@ def train_epoch(model, loader, optimizer, loss_fn, epoch: int) -> float:
     for Xb, yb, mb in pbar:
         Xb, yb, mb = Xb.to(DEVICE), yb.to(DEVICE), mb.to(DEVICE)
 
+        # 标签转换（可选：收益率 → 百分位数排名）
+        yb_target = labels_to_ranks(yb, mb) if use_rank_labels else yb
+
         # 标准训练循环
         optimizer.zero_grad()                                 # 清空梯度累积
         scores, _ = model(Xb, mb)                             # 前向传播
-        loss = loss_fn(scores, yb, mb)                        # 计算损失
+        loss = loss_fn(scores, yb_target, mb)                 # 计算损失
         loss.backward()                                       # 反向传播（计算梯度）
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)  # 梯度裁剪
         optimizer.step()                                      # 更新参数
@@ -225,6 +266,7 @@ def train_model(
     lr: float = LR,
     weight_decay: float = WEIGHT_DECAY,
     loss_name: str = "lambdarank",
+    use_rank_labels: bool = False,
 ) -> PortfolioPredictor:
     """
     完整训练循环，包含：
@@ -247,7 +289,13 @@ def train_model(
     )
 
     # 选择损失函数
-    loss_fn = lambdarank_loss if loss_name == "lambdarank" else pairwise_ranking_loss
+    loss_map = {
+        "lambdarank": lambdarank_loss,
+        "pairwise": pairwise_ranking_loss,
+        "listnet": listnet_loss,
+        "topk_listnet": topk_listnet_loss,
+    }
+    loss_fn = loss_map.get(loss_name, listnet_loss)
 
     best_val_loss = float("inf")
     best_weights = None
@@ -255,7 +303,8 @@ def train_model(
 
     for epoch in range(1, epochs + 1):
         # ---- 训练 ----
-        train_loss = train_epoch(model, train_loader, optimizer, loss_fn, epoch)
+        train_loss = train_epoch(model, train_loader, optimizer, loss_fn, epoch,
+                                 use_rank_labels=use_rank_labels)
 
         # ---- 验证 ----
         val_metrics = evaluate(model, val_loader, loss_fn)
@@ -279,8 +328,11 @@ def train_model(
                 print(f"  Early stopping at epoch {epoch}")
                 break
 
-    # 恢复最优权重
-    model.load_state_dict(best_weights)
+    # 恢复最优权重（如果从未更新过，直接用当前权重）
+    if best_weights is not None:
+        model.load_state_dict(best_weights)
+    else:
+        print("  WARNING: No improvement found, using final weights")
     return model
 
 
@@ -377,11 +429,13 @@ def main():
                         help="强制重新下载所有数据（清除缓存）")
     parser.add_argument("--epochs", type=int, default=N_EPOCHS,
                         help=f"训练轮数（默认: {N_EPOCHS}）")
-    parser.add_argument("--loss", choices=["lambdarank", "pairwise"],
-                        default="lambdarank",
-                        help="损失函数: lambdarank（推荐） 或 pairwise")
+    parser.add_argument("--loss", choices=["lambdarank", "pairwise", "listnet", "topk_listnet"],
+                        default="listnet",
+                        help="损失函数: lambdarank/pairwise/listnet(推荐)/topk_listnet")
     parser.add_argument("--lr", type=float, default=LR,
                         help=f"学习率（默认: {LR}）")
+    parser.add_argument("--rank-labels", action="store_true",
+                        help="将收益率转为百分位数排名作为训练目标（推荐用于 listnet）")
     args = parser.parse_args()
 
     # ---- 可选：强制重新下载 ----
@@ -447,6 +501,7 @@ def main():
     model = train_model(
         model, train_loader, val_loader,
         epochs=args.epochs, lr=args.lr, loss_name=args.loss,
+        use_rank_labels=args.rank_labels,
     )
 
     # ==================================================================

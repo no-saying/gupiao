@@ -599,3 +599,113 @@ def combined_loss(
         div_loss = diversity_penalty(scores, features)
         return rank_loss + lambda_diverse * div_loss
     return rank_loss
+
+
+# =============================================================================
+# 损失 4: ListNet（Listwise 排序损失）—— 直接优化排序分布
+# =============================================================================
+
+def listnet_loss(
+    scores: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    temperature: float = 2.0,
+) -> torch.Tensor:
+    """
+    ListNet 排序损失（基于 Plackett-Luce 模型的 listwise 方法）。
+
+    对每只股票计算成为 top-1 的概率，优化预测与目标的分布一致。
+
+    Args:
+        scores:     (B, N)
+        targets:    (B, N)
+        valid_mask: (B, N)
+        temperature: float  — 较高的温度使梯度更平滑，避免 NaN
+    """
+    if valid_mask is None:
+        valid_mask = torch.ones_like(targets)
+
+    B, N = scores.shape
+    device = scores.device
+    losses = []
+
+    for i in range(B):
+        valid_idx = (valid_mask[i] > 0.5).nonzero(as_tuple=True)[0]
+        n_valid = len(valid_idx)
+        if n_valid < 2:
+            continue
+
+        s = scores[i, valid_idx]       # (n_valid,)
+        t = targets[i, valid_idx]      # (n_valid,)
+
+        # 数值稳定：减去最大值
+        s_shift = s - s.max()
+        t_shift = t - t.max()
+
+        # 转为概率分布（温度 > 1 使分布更平滑）
+        P = torch.softmax(s_shift / temperature, dim=0)
+        Q = torch.softmax(t_shift / temperature, dim=0)
+
+        # Cross-Entropy
+        loss_i = -(Q * torch.log(P + 1e-10)).sum()
+        losses.append(loss_i)
+
+    return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=device)
+
+
+# =============================================================================
+# 损失 5: Top-K ListNet —— 只关注前 K 只股票的排序
+# =============================================================================
+
+def topk_listnet_loss(
+    scores: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    k: int = 10,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """
+    Top-K ListNet 损失：只对分数最高的 K 只股票计算 ListNet 损失。
+
+    为什么是 Top-K？
+      - 我们只需要选 5 只股票，不需要排序所有 300 只
+      - 中低排名的股票排序噪声大，引入它们反而增加梯度噪声
+      - 只关注头部 K 只 (K > 5 给模型留余量) 的信号更干净
+
+    实现：
+      1. 选出模型预测分数最高的 K 只股票
+      2. 在这 K 只上计算 ListNet 损失
+    """
+    if valid_mask is None:
+        valid_mask = torch.ones_like(targets)
+
+    B, N = scores.shape
+    device = scores.device
+
+    # 屏蔽无效股票
+    masked_scores = scores.clone()
+    masked_scores[valid_mask < 0.5] = -1e9
+    masked_targets = targets.clone()
+    masked_targets[valid_mask < 0.5] = -1e9
+
+    losses = []
+    for i in range(B):
+        valid_idx = (valid_mask[i] > 0.5).nonzero(as_tuple=True)[0]
+        n_valid = len(valid_idx)
+        if n_valid < 2:
+            continue
+
+        k_actual = min(k, n_valid)
+
+        # 选模型分数最高的 K 只
+        topk_idx = torch.topk(masked_scores[i, valid_idx], k_actual).indices
+        topk_scores = scores[i, valid_idx[topk_idx]]
+        topk_targets = targets[i, valid_idx[topk_idx]]
+
+        # ListNet 在这 K 只上计算
+        log_P = torch.log_softmax(topk_scores / temperature, dim=0)
+        Q = torch.softmax(topk_targets / temperature, dim=0)
+        loss_i = -(Q * log_P).sum()
+        losses.append(loss_i)
+
+    return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=device)
