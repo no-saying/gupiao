@@ -1,13 +1,6 @@
 __pycache__/
 *.pyc
 .venv/
-data/
-models/
-.vscode/
+.claude/
 *.swp
-*.swo
 .DS_Store
-output/
-temp/
-result.csv
-.ipynb_checkpoints/
