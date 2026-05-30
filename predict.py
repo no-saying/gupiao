@@ -176,7 +176,7 @@ def generate_submission(
         )
 
     # 取最后一个样本（最新时间点）
-    X_latest = torch.from_numpy(X[-1:]).to(DEVICE)             # (1, N, T, F)
+    X_latest = torch.from_numpy(X[-1:]).to(DEVICE, dtype=torch.float32)
     mask_latest = torch.from_numpy(mask[-1:]).to(DEVICE)       # (1, N)
 
     print(f"[predict] Latest sample date: {dates[-1]}")
@@ -255,25 +255,58 @@ def main():
     print(f"[predict] Model loaded: {n_params:,} params")
 
     # ---- 加载数据 ----
-    # 优先从缓存加载处理后的数据，否则从头构建
     processed_path = PROCESSED_DIR / "samples.pkl"
     if processed_path.exists():
-        # 缓存命中：直接读取
         with open(processed_path, "rb") as f:
             data = pickle.load(f)
         print(f"[predict] Loaded processed data: {data['X'].shape[0]} samples")
-        # 用已有数据构建 Panel
         panel = build_panel(stock_ids)
-        panel = engineer_features(panel)
+        panel = engineer_features(panel, stock_ids)
     else:
-        # 从头构建（可能要花几分钟）
         print("[predict] No cached data, building from scratch ...")
-        print("[predict] This may take a few minutes ...")
         panel = build_panel(stock_ids)
-        panel = engineer_features(panel)
+        panel = engineer_features(panel, stock_ids)
 
-    # ---- 生成提交 ----
-    generate_submission(model, stock_ids, panel, Path(args.output))
+    # ---- 应用标准化参数 ----
+    feat_mean = checkpoint.get("feat_mean", None)
+    feat_std = checkpoint.get("feat_std", None)
+
+    X, y, mask, dates = make_window_samples(panel, stock_ids, normalize=False)
+    if feat_mean is not None and feat_std is not None:
+        X = (X - feat_mean) / feat_std
+        print("[predict] Applied saved normalization stats")
+    elif len(X) > 0:
+        m = X.mean(axis=(0, 1, 2), keepdims=True)
+        s = X.std(axis=(0, 1, 2), keepdims=True)
+        X = (X - m) / (s + 1e-8)
+        print("[predict] WARNING: Applied data-level normalization")
+
+    # ---- 预测最新样本 ----
+    X_latest = torch.from_numpy(X[-1:]).to(DEVICE)
+    mask_latest = torch.from_numpy(mask[-1:]).to(DEVICE)
+    print(f"[predict] Latest sample date: {dates[-1]}")
+
+    model.eval()
+    with torch.no_grad():
+        scores, attn_weights = model(X_latest, mask_latest)
+        scores = scores.squeeze(0).cpu().numpy()
+        embeddings = model.encode_stocks(X_latest, mask_latest)
+        embeddings = embeddings.squeeze(0).cpu()
+
+    mask_np = mask_latest.squeeze(0).cpu().numpy()
+    valid_idx = np.where(mask_np > 0.5)[0]
+    print(f"[predict] Valid stocks: {len(valid_idx)} / {len(stock_ids)}")
+
+    # ---- 多样化选股 ----
+    selected = select_diverse_portfolio(scores, stock_ids, embeddings)
+    df = pd.DataFrame(selected, columns=["stock_id", "weight"])
+    total_weight = df["weight"].sum()
+    n_stocks = len(df)
+    print(f"[predict] Selected {n_stocks} stocks, total weight = {total_weight:.4f}")
+    output_path = Path(args.output)
+    df.to_csv(output_path, index=False, encoding="utf-8")
+    print(f"[predict] Submission saved to {output_path}")
+    print(df.to_string(index=False))
 
 
 if __name__ == "__main__":

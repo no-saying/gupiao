@@ -243,7 +243,76 @@ def build_panel(
 
 
 # =============================================================================
-# 获取其他关联市场指数数据
+# 获取中证 500 成分股
+# =============================================================================
+
+def fetch_zz500_stocks() -> list[str]:
+    """
+    从 baostock 获取中证 500 成分股列表，与沪深 300 互补覆盖中盘股。
+    """
+    cache_path = RAW_DIR / "zz500_stocks.pkl"
+    if cache_path.exists():
+        return pickle.loads(cache_path.read_bytes())
+
+    bs.login()
+    rs = bs.query_zz500_stocks()
+    stocks = []
+    while rs.next():
+        row = rs.get_row_data()
+        stocks.append(row[1])
+    bs.logout()
+
+    processed = sorted(set(_strip_code(s) for s in stocks))
+    cache_path.write_bytes(pickle.dumps(processed))
+    print(f"[data] Fetched {len(processed)} CSI 500 stocks")
+    return processed
+
+
+def fetch_extended_stocks() -> list[str]:
+    """
+    合并沪深 300 + 中证 500 成分股，去重后作为扩展股票池。
+    覆盖约 800 只大中盘股票，提供更丰富的截面信息。
+    """
+    hs300 = fetch_csi300_stocks()
+    zz500 = fetch_zz500_stocks()
+    combined = sorted(set(hs300) | set(zz500))
+    print(f"[data] Extended stock pool: {len(hs300)} CSI300 + "
+          f"{len(zz500)} CSI500 = {len(combined)} unique stocks")
+    return combined
+
+
+# =============================================================================
+# 获取股票行业分类
+# =============================================================================
+
+def fetch_stock_industries(stock_ids: list[str] | None = None) -> dict[str, str]:
+    """
+    从 baostock 获取股票行业分类（证监会行业分类标准）。
+    """
+    cache_path = RAW_DIR / "stock_industries.pkl"
+    if cache_path.exists():
+        industries = pickle.loads(cache_path.read_bytes())
+        if stock_ids is None:
+            return industries
+        return {s: industries.get(s, "Unknown") for s in stock_ids}
+
+    bs.login()
+    rs = bs.query_stock_industry()
+    industries = {}
+    while rs.next():
+        row = rs.get_row_data()
+        code = _strip_code(row[1])
+        industry = row[3] if row[3] else "Unknown"
+        industries[code] = industry
+    bs.logout()
+
+    cache_path.write_bytes(pickle.dumps(industries))
+    print(f"[data] Fetched {len(industries)} stock industries")
+    return industries
+
+
+# =============================================================================
+# 获取关联市场指数数据
 # =============================================================================
 
 def fetch_index_data(

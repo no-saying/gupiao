@@ -54,14 +54,14 @@ from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
 
 from config import (
-    MODEL_DIR, PROCESSED_DIR, DEVICE, D_MODEL,
+    MODEL_DIR, PROCESSED_DIR, DEVICE,
     BATCH_SIZE, N_EPOCHS, LR, WEIGHT_DECAY, GRAD_CLIP,
     LR_PATIENCE, EARLY_STOP_PATIENCE, VAL_RATIO, TEST_RATIO,
     LOOKBACK_DAYS, PREDICT_HORIZON, STEP_DAYS,
     MAX_STOCKS, TOP_K_CANDIDATES, TEMPERATURE,
 )
 from data_loader import fetch_csi300_stocks, build_panel
-from features import engineer_features, make_window_samples
+from features import engineer_features, make_window_samples, get_norm_stats
 from model import PortfolioPredictor, lambdarank_loss, pairwise_ranking_loss
 
 
@@ -267,9 +267,9 @@ def train_model(
         scheduler.step(val_metrics["loss"])
 
         # ---- 模型保存 & Early Stopping ----
-        if val_metrics["loss"] < best_val_loss:
+        # 使用容差避免浮点抖动导致的虚假 "best model"
+        if val_metrics["loss"] < best_val_loss - 1e-7:
             best_val_loss = val_metrics["loss"]
-            # 深拷贝最优权重（不能用 model.state_dict() 直接赋值，会被后续更新覆盖）
             best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
             print(f"  → New best model (val_loss={best_val_loss:.4f})")
@@ -393,18 +393,18 @@ def main():
         print("[train] Cleared data cache, will re-download.")
 
     # ==================================================================
-    # Step 1-2: 数据获取
+    # Step 1-2: 数据获取（沪深300 + 中证500 = ~800 只股票）
     # ==================================================================
     print("=" * 60)
-    print("Step 1: Fetch CSI 300 stocks & daily data")
+    print("Step 1: Fetch CSI 300 stocks")
     stock_ids = fetch_csi300_stocks()
     panel = build_panel(stock_ids)
 
     # ==================================================================
-    # Step 3: 特征工程
+    # Step 2: 特征工程
     # ==================================================================
     print("\nStep 2: Feature engineering")
-    panel = engineer_features(panel)
+    panel = engineer_features(panel, stock_ids)
 
     # ==================================================================
     # Step 3: 构造训练样本
@@ -476,10 +476,15 @@ def main():
     # Step 7: 保存模型
     # ==================================================================
     model_path = MODEL_DIR / "portfolio_model.pt"
+    norm_stats = get_norm_stats()
+    feat_mean = np.array(norm_stats[0]) if norm_stats is not None else None
+    feat_std  = np.array(norm_stats[1]) if norm_stats is not None else None
     torch.save({
         "model_state_dict": model.state_dict(),
         "feature_cols": feature_cols,
         "stock_ids": stock_ids,
+        "feat_mean": feat_mean,
+        "feat_std": feat_std,
         "config": {
             "n_features": n_features,
             "d_model": D_MODEL,
