@@ -62,9 +62,24 @@ def compute_rankic(pred_df, pred_col='lgb_score', target_col='target'):
     return float(np.mean(ics)) if ics else 0.0
 
 
-def train_lgbm_ranker(df, feature_cols, model_path=None):
+def _pct_rank_per_group(scores, groups):
+    """按 group 计算百分位排名 [0,1]，用于 DoubleEnsemble 误差加权。"""
+    ranks = np.empty(len(scores), dtype=np.float32)
+    start = 0
+    for g in groups:
+        end = start + g
+        s = scores[start:end]
+        ranks[start:end] = (s.argsort().argsort().astype(float) + 1) / max(g, 1)
+        start = end
+    return ranks
+
+
+def train_lgbm_ranker(df, feature_cols, model_path=None,
+                      double_ensemble: bool = False,
+                      de_n_models: int = 6,
+                      de_sub_feature_ratio: float = 0.7):
     import lightgbm as lgb
-    if model_path and model_path.exists():
+    if model_path and model_path.exists() and not double_ensemble:
         model = lgb.Booster(model_file=str(model_path))
         print("  Loaded cached LGBM model")
         return model, df[feature_cols].mean(), df[feature_cols].std().replace(0, 1), None
@@ -80,6 +95,8 @@ def train_lgbm_ranker(df, feature_cols, model_path=None):
     grp = train_df.groupby('date').size().values
     print(f"  Training LGBM ({len(train_df)} rows, {len(grp)} dates)...")
 
+    # ── M0: 全特征训练 ──
+    print(f"  [DE] M0: {len(feature_cols)} features, uniform weights")
     model = lgb.LGBMRanker(
         objective='lambdarank', boosting_type='gbdt',
         n_estimators=500, num_leaves=63, learning_rate=0.05,
@@ -88,15 +105,72 @@ def train_lgbm_ranker(df, feature_cols, model_path=None):
         label_gain=[i for i in range(10)], verbose=-1, random_state=42)
     model.fit(X_tr, y_tr, group=grp, eval_metric=['ndcg'], callbacks=[lgb.log_evaluation(0)])
 
-    # 验证集 RankIC
-    val_pred = model.predict(((val_df[feature_cols].values - fm.values) / fs.values).astype(np.float32))
+    # ── DoubleEnsemble: 70% 特征子采样 + M0 误差加权 ──
+    de_models = [model]  # M0 is first
+    if double_ensemble and de_n_models > 1:
+        # 获取 M0 在训练集上的预测
+        m0_train_pred = model.predict(X_tr)
+        train_grp_sizes = grp
+        m0_ranks = _pct_rank_per_group(m0_train_pred, train_grp_sizes)
+        # 训练 label 的百分位 (rank_label 是 0-9 分位数)
+        label_ranks = np.clip(y_tr.astype(float) / 9.0, 0, 1)
+        # 排序误差 = |M0百分位 - label百分位|
+        errors = np.abs(m0_ranks - label_ranks) + 1e-6
+
+        n_feats = len(feature_cols)
+        rng = np.random.RandomState(42)
+
+        for i in range(1, de_n_models):
+            # 70% 随机特征子集
+            k = max(1, int(n_feats * de_sub_feature_ratio))
+            feat_idx = rng.choice(n_feats, size=k, replace=False)
+            sub_feats = [feature_cols[j] for j in sorted(feat_idx)]
+
+            # 按 M0 误差重加权样本
+            sample_w = (errors / errors.mean()).astype(np.float32)
+
+            # 子集数据
+            X_sub = (train_df[sub_feats].values - fm[sub_feats].values) / fs[sub_feats].values
+            grp_sub = grp  # group 不变（同一批日期）
+
+            print(f"  [DE] M{i}: {len(sub_feats)} features, error-weighted")
+            sub_model = lgb.LGBMRanker(
+                objective='lambdarank', boosting_type='gbdt',
+                n_estimators=500, num_leaves=63, learning_rate=0.05,
+                min_child_samples=20, reg_lambda=0.1, reg_alpha=0.1,
+                subsample=0.8, colsample_bytree=0.8,
+                label_gain=[i for i in range(10)], verbose=-1, random_state=42 + i)
+            sub_model.fit(X_sub, y_tr, group=grp_sub,
+                          sample_weight=sample_w,
+                          eval_metric=['ndcg'], callbacks=[lgb.log_evaluation(0)])
+            de_models.append((sub_model, feat_idx))
+
+        print(f"  [DE] Trained {len(de_models)} models ({de_n_models-1} subsampled + 1 full)")
+
+    # 验证集 RankIC (用 M0 或 DE 融合分数)
+    if double_ensemble and len(de_models) > 1:
+        val_X = ((val_df[feature_cols].values - fm.values) / fs.values).astype(np.float32)
+        val_grp_sizes = val_df.groupby('date').size().values
+        val_ranks = np.zeros(len(val_df))
+        val_ranks += _pct_rank_per_group(model.predict(val_X), val_grp_sizes)  # M0
+        for sub_model, feat_idx in de_models[1:]:
+            sub_feats = [feature_cols[j] for j in sorted(feat_idx)]
+            val_X_sub = ((val_df[sub_feats].values - fm[sub_feats].values) / fs[sub_feats].values).astype(np.float32)
+            val_ranks += _pct_rank_per_group(sub_model.predict(val_X_sub), val_grp_sizes)
+        val_pred = val_ranks / len(de_models)
+    else:
+        val_pred = model.predict(((val_df[feature_cols].values - fm.values) / fs.values).astype(np.float32))
+
     val_df = val_df.copy()
     val_df['lgb_score'] = val_pred
     rankic = compute_rankic(val_df, 'lgb_score', 'target')
     print(f"  Val RankIC (last 5 days): {rankic:.4f}")
 
-    if model_path:
+    if model_path and not double_ensemble:
         model.booster_.save_model(str(model_path))
+
+    if double_ensemble:
+        return de_models, fm, fs, rankic, feature_cols
     return model, fm, fs, rankic
 
 
@@ -104,8 +178,25 @@ def train_lgbm_ranker(df, feature_cols, model_path=None):
 def predict_lgbm(model, fm, fs, df, feature_cols, date):
     day = df[df['date'] == date].copy()
     if len(day) == 0: return None
-    X = (day[feature_cols].values - fm.values) / fs.values
-    day['lgb_score'] = model.predict(X)
+    # 如果是 DoubleEnsemble 模型列表
+    if isinstance(model, list):
+        n_models = len(model)
+        groups = [len(day)]  # 单日，group_size = 全部股票
+        rank_sum = np.zeros(len(day), dtype=np.float64)
+        for i, item in enumerate(model):
+            if i == 0:
+                # M0: 全特征
+                X = (day[feature_cols].values - fm.values) / fs.values
+                rank_sum += _pct_rank_per_group(item.predict(X), groups)
+            else:
+                sub_model, feat_idx = item
+                sub_feats = [feature_cols[j] for j in sorted(feat_idx)]
+                X_sub = (day[sub_feats].values - fm[sub_feats].values) / fs[sub_feats].values
+                rank_sum += _pct_rank_per_group(sub_model.predict(X_sub), groups)
+        day['lgb_score'] = (rank_sum / n_models).astype(np.float32)
+    else:
+        X = (day[feature_cols].values - fm.values) / fs.values
+        day['lgb_score'] = model.predict(X)
     return day
 
 
@@ -502,6 +593,10 @@ def main():
     parser.add_argument("--cash-buffer", type=float, default=None,
                         help="自适应现金仓位阈值。信号弱时保留现金(默认关闭)。"
                              "参考Game-BDC2026 T7: 值越大越保守")
+    parser.add_argument("--center", action="store_true",
+                        help="零均值居中: 选股前对分数做零均值处理(消除系统性偏差)")
+    parser.add_argument("--double-ensemble", action="store_true",
+                        help="LGBM DoubleEnsemble: 特征子采样(70%) + M0误差加权训练6个模型")
 
     args = parser.parse_args()
 
@@ -527,7 +622,12 @@ def main():
         latest_date = sorted(lgbm_df['date'].unique())[-1]
         model_path = MODEL_DIR / "lgbm_ranker.txt"
         if args.no_cache and model_path.exists(): model_path.unlink()
-        lgbm_model, lgbm_fm, lgbm_fs, lgbm_rankic = train_lgbm_ranker(lgbm_df, feat_cols, model_path)
+        lgbm_result = train_lgbm_ranker(lgbm_df, feat_cols, model_path,
+                                         double_ensemble=args.double_ensemble)
+        if args.double_ensemble:
+            lgbm_model, lgbm_fm, lgbm_fs, lgbm_rankic, _ = lgbm_result
+        else:
+            lgbm_model, lgbm_fm, lgbm_fs, lgbm_rankic = lgbm_result
         lgbm_day = predict_lgbm(lgbm_model, lgbm_fm, lgbm_fs, lgbm_df, feat_cols, latest_date)
         lgbm_scores = lgbm_day.set_index('stock_id')['lgb_score'].to_dict()
 
@@ -645,6 +745,14 @@ def main():
         scores = np.array([lgbm_scores.get(s, -999) for s in stock_ids])
     else:
         print("[ERROR] No scores"); return
+
+    # ── 零均值居中（选股前消除系统性偏差） ──
+    if args.center:
+        valid_center = np.where(m_lt > 0.5)[0]
+        if len(valid_center) > 0:
+            scores = scores.copy()
+            scores[valid_center] = scores[valid_center] - scores[valid_center].mean()
+            print(f"  Zero-sum centering applied (mean before: {scores[valid_center].mean():.6f})")
 
     # ── 候选池 ──
     valid = np.where(m_lt > 0.5)[0]

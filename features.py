@@ -235,7 +235,8 @@ def add_extra_index_features(panel: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def add_cross_sectional_features(panel: pd.DataFrame) -> pd.DataFrame:
-    """计算个股在全市场中的排名分位数。"""
+    """计算个股在全市场中的排名分位数和截面特征。"""
+    # 原有截面排名
     cross_cols = {
         "ret_5d": "ret_5d_rank", "ret_20d": "ret_20d_rank",
         "vol_5d": "vol_5d_rank", "rsi_14": "rsi_rank",
@@ -243,7 +244,65 @@ def add_cross_sectional_features(panel: pd.DataFrame) -> pd.DataFrame:
     for src, dst in cross_cols.items():
         if src in panel.columns:
             panel[dst] = panel.groupby("date")[src].rank(pct=True)
+
+    # 超额收益 (excess_return_1d): 个股日收益 - 等权市场平均
+    if "pctChg" in panel.columns:
+        market_avg = panel.groupby("date")["pctChg"].transform("mean")
+        panel["excess_return_1d"] = (panel["pctChg"] - market_avg) / 100.0
+
+    # 截面收盘价和成交量百分位
+    if "close" in panel.columns:
+        panel["cs_rank_close"] = panel.groupby("date")["close"].rank(pct=True)
+    if "volume" in panel.columns:
+        panel["cs_rank_volume"] = panel.groupby("date")["volume"].rank(pct=True)
+
     return panel
+
+
+# =============================================================================
+# 日历特征（A股日历效应）
+# =============================================================================
+
+def add_calendar_features(panel: pd.DataFrame) -> pd.DataFrame:
+    """添加日历特征：周几、月份周期、月末、春节前后。
+
+    参考 Game-BDC2026 features_extra.py 的 add_calendar_features
+    """
+    df = panel.reset_index()
+    dates = df["date"]
+
+    # 周几 one-hot (Mon=0, Thu=3, Fri=4为baseline)
+    dow = dates.dt.dayofweek
+    for i in range(4):
+        df[f"wday_{i}"] = (dow == i).astype(np.float32)
+
+    # 月份正弦/余弦编码 (捕获周期性)
+    month = dates.dt.month.astype(float)
+    df["month_sin"] = np.sin(2 * np.pi * month / 12.0).astype(np.float32)
+    df["month_cos"] = np.cos(2 * np.pi * month / 12.0).astype(np.float32)
+
+    # 月末标记: 当月最后交易日
+    df["is_month_end"] = dates.dt.is_month_end.astype(np.float32)
+
+    # 春节前后窗口 (~5个交易日)
+    # 2021-2027年春节日期
+    cny_dates = [
+        "2021-02-12", "2022-02-01", "2023-01-22",
+        "2024-02-10", "2025-01-29", "2026-02-17",
+        "2027-02-06",
+    ]
+    cny_dates = pd.to_datetime(cny_dates)
+    cny_window = pd.Timedelta(days=10)  # 春节前后约5个交易日
+
+    df["is_cny_before"] = 0.0
+    df["is_cny_after"] = 0.0
+    for cny in cny_dates:
+        before_mask = (dates >= cny - cny_window) & (dates < cny)
+        after_mask = (dates > cny) & (dates <= cny + cny_window)
+        df.loc[before_mask, "is_cny_before"] = 1.0
+        df.loc[after_mask, "is_cny_after"] = 1.0
+
+    return df.set_index(["date", "stock_id"])
 
 
 # =============================================================================
@@ -265,6 +324,9 @@ def add_industry_features(panel: pd.DataFrame, stock_ids: list[str]) -> pd.DataF
     if "vol_5d" in panel.columns:
         panel["ind_vol_5d"] = panel.groupby(["date", "industry"])["vol_5d"].transform("mean")
     panel["industry_size"] = panel.groupby(["date", "industry"])["industry"].transform("count")
+    # 行业内收益百分位排名
+    if "pctChg" in panel.columns:
+        panel["industry_rank_return"] = panel.groupby(["date", "industry"])["pctChg"].rank(pct=True)
     return panel
 
 
@@ -420,6 +482,9 @@ def engineer_features(panel: pd.DataFrame, stock_ids: list[str] | None = None) -
 
     print("[features] Adding cross-sectional rank features ...")
     panel = add_cross_sectional_features(panel)
+
+    print("[features] Adding calendar features ...")
+    panel = add_calendar_features(panel)
 
     print("[features] Adding industry features ...")
     if stock_ids is None:
