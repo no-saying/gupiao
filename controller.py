@@ -628,6 +628,10 @@ def main():
                         help="超买过滤: RSI>75或10日涨幅超20pct排除")
     parser.add_argument("--diverse-industry", type=int, default=None,
                         help="行业分散: 同行业最多N只")
+    parser.add_argument("--smart", action="store_true",
+                        help="智能选股: 板块轮动+拥挤度+顶点分析+宏观过滤")
+    parser.add_argument("--max-score", action="store_true",
+                        help="极限分数模式: softmax+无过滤器+game智能调节")
 
     args = parser.parse_args()
 
@@ -774,6 +778,42 @@ def main():
             scores = scores.copy()
             scores[valid_center] = scores[valid_center] - scores[valid_center].mean()
             print(f"  Zero-sum centering applied (mean before: {scores[valid_center].mean():.6f})")
+
+    # ── 极限分数模式: 宏观+赛道拥挤度+顶点博弈 ──
+    if getattr(args, 'max_score', False):
+        print(f"\n  {'='*50}")
+        print(f"  极限分数模式 — 市场分析 + 博弈论")
+        print(f"  {'='*50}")
+        try:
+            sample_stock = stock_ids[0]
+            sd = panel.xs(sample_stock, level="stock_id")
+            market_20d = sd['pctChg'].iloc[-20:].sum() / 100.0
+            market_5d = sd['pctChg'].iloc[-5:].mean() / 100.0
+            regime = "牛市" if market_20d > 0.03 and market_5d > 0 else "震荡" if market_20d > -0.03 else "熊市"
+            print(f"  宏观: {regime} (20d={market_20d:+.1%}, 5d={market_5d:+.1%})")
+        except:
+            pass
+        # 赛道拥挤度
+        if 'industry' in panel.columns:
+            ind_counts = {}
+            for sid in pool_ids if 'pool_ids' in dir() else []:
+                try:
+                    ind = str(panel.xs(sid, level='stock_id')['industry'].iloc[-1])
+                    ind_counts[ind] = ind_counts.get(ind, 0) + 1
+                except:
+                    pass
+            if ind_counts:
+                top_sectors = sorted(ind_counts.items(), key=lambda x: -x[1])[:5]
+                print(f"  赛道拥挤(top40):")
+                for ind, cnt in top_sectors:
+                    pct = cnt / len(pool_ids) * 100
+                    print(f"    {'⚠' if pct > 25 else ' '} {ind}: {cnt}只({pct:.0f}%)")
+                # 超拥挤→自动加强博弈
+                if any(cnt/len(pool_ids) > 0.25 for _, cnt in top_sectors):
+                    if args.game is not None and args.game < 0.5:
+                        args.game = min(0.5, args.game * 1.5)
+                        print(f"  博弈升级: λ→{args.game:.2f}(赛道拥挤)")
+        print()
 
     # ── 候选池 ──
     valid = np.where(m_lt > 0.5)[0]
