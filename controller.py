@@ -228,15 +228,92 @@ def load_predict(path, X_np, n_features=None):
 
 
 # =============================================================================
+# HMM 市场状态 + 动态 MoE 融合
+# =============================================================================
+
+def compute_market_regime(panel, n_states=3, seq_len=63):
+    """
+    HMM 隐马尔可夫模型市场状态识别。
+    基于等权市场收益率序列，识别牛/震荡/熊三种状态。
+    返回: (regime_id, regime_name, transition_prob)
+    """
+    from hmmlearn import hmm
+    # 提取等权市场日收益率
+    try:
+        first_stock = panel.index.get_level_values('stock_id').unique()[0]
+        sd = panel.xs(first_stock, level='stock_id')
+        ret = sd['pctChg'].iloc[-seq_len:].values / 100.0
+        ret = np.nan_to_num(ret, nan=0.0)
+        ret = ret.reshape(-1, 1)
+
+        # 训练 3 状态 HMM
+        model = hmm.GaussianHMM(n_components=n_states, covariance_type='diag',
+                                 n_iter=100, random_state=42)
+        model.fit(ret)
+        states = model.predict(ret)
+
+        # 按均值排序: 0=熊, 1=震荡, 2=牛 (假设收益率均值递增)
+        state_means = [np.mean(ret[states == s]) for s in range(n_states)]
+        order = np.argsort(state_means)
+        state_map = {order[0]: 0, order[1]: 1, order[2]: 2}  # 0=熊, 1=震荡, 2=牛
+        current_state = state_map[states[-1]]
+
+        # 转移概率
+        trans_prob = model.transmat_[states[-1], :]
+        next_probs = {0: trans_prob[order[0]], 1: trans_prob[order[1]], 2: trans_prob[order[2]]}
+
+        regime_names = {0: "熊市", 1: "震荡", 2: "牛市"}
+        return {
+            "id": current_state,
+            "name": regime_names[current_state],
+            "next_bear": next_probs[0],
+            "next_bull": next_probs[2],
+            "volatility": float(np.std(ret)),
+        }
+    except Exception as e:
+        return {"id": 1, "name": "震荡", "next_bear": 0.0, "next_bull": 0.0, "volatility": 0.0}
+
+
+def dynamic_moe_blend(lgbm_scores, nn_scores, regime, base_lgbm_w=0.7):
+    """
+    动态混合专家 (MoE): 根据市场状态动态调整 LGBM/NN 融合权重。
+    牛市→NN权重高(捕捉趋势)，熊市→LGBM权重高(截面排序稳健)，震荡→均衡。
+    """
+    if nn_scores is None:
+        return lgbm_scores
+
+    regime_id = regime["id"]
+    # 牛市: NN 0.4, LGBM 0.6; 熊市: NN 0.15, LGBM 0.85; 震荡: 默认
+    if regime_id == 2:  # 牛市
+        nn_w = 0.40
+    elif regime_id == 0:  # 熊市
+        nn_w = 0.15
+    else:
+        nn_w = 0.30
+
+    lgbm_w = 1.0 - nn_w
+
+    def norm(s):
+        mn, mx = s.min(), s.max()
+        if mx - mn < 1e-9: return np.zeros_like(s)
+        return (s - mn) / (mx - mn)
+
+    blend = lgbm_w * norm(lgbm_scores) + nn_w * norm(nn_scores)
+    print(f"  MoE: {regime['name']} → LGBM={lgbm_w:.2f} NN={nn_w:.2f}")
+    return blend
+
+
+# =============================================================================
 # 纳什均衡选股
 # =============================================================================
 
 def nash_equilibrium_selection(candidate_ids, candidate_scores, stock_idx_map, panel,
-                                X_panel=None, lam=0.25, n_features=57):
+                                X_panel=None, lam=None, n_features=57):
     """
     在候选股中求解纯策略纳什均衡。
     效用 = 平均分数 - λ × 平均内部相似度
 
+    lam = None 时自动确定：λ = mean_sim × 0.5（候选越拥挤 λ 越大）
     """
     n = len(candidate_ids)
     if n < 5:
@@ -266,6 +343,21 @@ def nash_equilibrium_selection(candidate_ids, candidate_scores, stock_idx_map, p
     e = emb[idxs]
     e_n = e / (np.linalg.norm(e, axis=1, keepdims=True) + 1e-9)
     sim = e_n @ e_n.T
+
+    # ── 自动确定 λ ──
+    n_pool = len(candidate_ids)
+    if lam is None:
+        upper_tri = np.triu(sim, k=1)
+        mean_sim = upper_tri.sum() / max(n_pool * (n_pool - 1) / 2, 1)
+        # λ = mean_sim × 0.5, 候选越拥挤 λ 越大, clamp [0.05, 0.8]
+        lam = np.clip(mean_sim * 0.5, 0.05, 0.8)
+        # 池子小时自动降低(原有逻辑)
+        if n_pool <= 10:
+            lam = lam * 0.6
+        print(f"    Auto λ={lam:.3f} (mean_sim={mean_sim:.3f}, pool={n_pool})")
+    else:
+        if n_pool <= 10:
+            lam = lam * 0.6
 
     sc = np.array(candidate_scores)
 
@@ -452,11 +544,8 @@ def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
 
     # ── 纳什均衡（放在门控之后，在约10~15只里做多样化）──
     # 池子太小(<7)跳过；池子适中(7~10)放松阈值；池子够大(>10)正常触发
-    if (args.game is not None and stock_idx_map is not None
-            and X_lt is not None and len(precision_ids) >= 7):
-        lam = max(0, min(1, args.game))
-        if len(precision_ids) <= 10:
-            lam = lam * 0.6  # 小池子降低竞争强度，保留更多动量股
+    if stock_idx_map is not None and X_lt is not None and len(precision_ids) >= 7:
+        lam = max(0, min(1, args.game)) if args.game is not None else None
         # 用 X_lt 的实际特征数
         actual_n_features = X_lt.shape[-1] if hasattr(X_lt, 'shape') else n_features
         print(f"  Nash eq (λ={lam:.3f}, gate-pool={len(precision_ids)}, feats={actual_n_features})...")
@@ -616,8 +705,8 @@ def main():
     parser.add_argument("--weight", type=str, default="bdc", choices=["equal", "softmax", "inv_vol", "bdc"])
     parser.add_argument("--output", type=str, default=str(SUBMISSION_PATH))
     parser.add_argument("--no-cache", action="store_true")
-    parser.add_argument("--game", type=float, nargs="?", const=0.25, default=None,
-                        help="纳什均衡多样化λ")
+    parser.add_argument("--game", type=float, nargs="?", const=None, default=None,
+                        help="纳什均衡λ (默认: 自动根据拥挤度确定, 如--game 0.25)")
     parser.add_argument("--multi-day", type=int, default=1, choices=[1,2,3,4,5],
                         help="多日 Rolling 预测")
     parser.add_argument("--cash-buffer", type=float, default=None,
@@ -632,6 +721,8 @@ def main():
                         help="智能选股: 板块轮动+拥挤度+顶点分析+宏观过滤")
     parser.add_argument("--max-score", action="store_true",
                         help="极限分数模式: softmax+无过滤器+game智能调节")
+    parser.add_argument("--moe", action="store_true",
+                        help="动态MoE融合: HMM市场状态自适应LGBM/NN权重")
 
     args = parser.parse_args()
 
@@ -711,15 +802,19 @@ def main():
             if lgbm_day is not None:
                 lgbm_dict = lgbm_day.set_index('stock_id')['lgb_score'].to_dict()
                 lgbm_day_arr = np.array([lgbm_dict.get(s, 0) for s in stock_ids])
-            # 融合
-            blend = 0.7 * norm(lgbm_day_arr) + 0.3 * norm(gp_day)
+            # 融合 (支持动态 MoE)
+            if args.moe:
+                regime = compute_market_regime(panel)
+                blend = dynamic_moe_blend(lgbm_day_arr, gp_day, regime)
+            else:
+                blend = 0.7 * norm(lgbm_day_arr) + 0.3 * norm(gp_day)
             ensemble += dw[i] * blend
             if n_days > 1:
                 print(f"    Day {i+1}({date_str}): w={dw[i]:.2f}")
         nn_scores = ensemble
         if n_days > 1:
             print(f"  {n_days}-day rolling ensemble (weights={dict(enumerate(dw))})")
-        else:
+        elif not args.moe:
             print("  LightGBM(0.7) + NN GP(0.3) blend")
 
     # Compare 模式

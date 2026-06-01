@@ -206,6 +206,7 @@ python controller.py --ensemble compare
 | `--cash-buffer` | — | float | 信号弱时保留现金比例 |
 | `--center` | — | flag | 零均值居中消除偏差 |
 | `--max-score` | — | flag | 极限分数:宏观分析+赛道拥挤+博弈 |
+| `--moe` | — | flag | 动态MoE: HMM市场状态自适应LGBM/NN权重 |
 | `--no-cache` | — | flag | 强制重训LGBM |
 | `--topk` | 5 | 1-5 | 选股数量 |
 | `--output` | output/result.csv | path | 输出路径 |
