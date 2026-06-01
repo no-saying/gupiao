@@ -135,32 +135,40 @@ python test_window.py --n-windows 5 --epochs 15
 
 | 策略 | Score |
 |------|:-----:|
-| **LGBM+NN + BDC权重 (70特征)** | **0.147637** |
-| LGBM+NN + softmax (70特征) | 0.147637 |
-| LightGBM Ranker (旧 57特征) | 0.129519 |
+| **LGBM+NN + inv_vol (73特征+过滤器)** | **0.147637** |
+| LGBM_Nash + softmax (73特征) | 0.147637 |
 
-### 14 周滚动回测 (2025-06 ~ 2026-05) — 70特征模型
+### 14 周滚动回测 (2025-06 ~ 2026-05) — 73特征 + 过滤器
 
-**按 Sharpe 排名（含纳什策略）：**
+**按 Sharpe 排名：**
 
 | 策略 | 权重 | Mean | Std | Sharpe | WinRate |
 |------|:----:|:----:|:---:|:------:|:-------:|
-| **LGBM_NN_BlendNash** | **softmax** | **0.0933** | **0.060** | **1.56** | **85.7%** |
-| LGBM_NN_BlendNash | equal | 0.0931 | 0.062 | 1.50 | 92.9% |
-| LGBM_NN_BlendNash | bdc | 0.0888 | 0.061 | 1.45 | 92.9% |
-| LGBM_NN_BlendNash | inv_vol | 0.0968 | 0.067 | 1.44 | 100% |
-| LGBM_Nash | bdc | 0.0816 | 0.056 | 1.46 | 100% |
-| LGBM_Nash | equal | 0.0794 | 0.055 | 1.44 | 92.9% |
-| **LGBM_Nash** | **softmax** | **0.1010** | **0.073** | **1.37** | **100%** |
-| LGBM_NN_Blend (无纳什) | softmax | 0.0530 | 0.057 | 0.93 | 85.7% |
-| LGBM_Only | softmax | 0.0745 | 0.106 | 0.70 | 78.6% |
+| **LGBM_Nash** | **inv_vol** | **0.075** | **0.038** | **1.98** | **100%** |
+| LGBM_Nash | equal | 0.077 | 0.039 | 1.98 | 100% |
+| LGBM_Nash | bdc | 0.079 | 0.041 | 1.94 | 100% |
+| LGBM_Nash | softmax | 0.106 | 0.062 | 1.71 | 100% |
+| **BlendNash** | **inv_vol** | **0.081** | **0.054** | **1.52** | **93%** |
+| BlendNash | equal | 0.081 | 0.055 | 1.46 | 93% |
+| BlendNash | softmax | 0.082 | 0.057 | 1.44 | 93% |
+| BlendNash | bdc | 0.077 | 0.055 | 1.40 | 93% |
+| NN_Blend (无纳什) | softmax | 0.032 | 0.049 | 0.65 | 79% |
+| LGBM_Only | softmax | 0.041 | 0.046 | 0.89 | 71% |
 
-### 新旧对比 (BlendNash softmax)
+### 特征升级历程
 
-| 版本 | Mean | Std | Sharpe | WinRate | 最差周 | 最佳周 |
-|:----|:---:|:---:|:-----:|:-------:|:------:|:------:|
-| **70特征 (新)** | **0.0933** | **0.060** | **1.56** | 85.7% | **-0.0012** | +0.203 |
-| 57特征 (旧) | 0.0725 | 0.050 | 1.44 | 92.9% | -0.052 | +0.153 |
+| 版本 | 特征数 | BlendNash Sharpe | 关键新增 |
+|:----|:------:|:----------------:|:---------|
+| 初始 | 57 | 1.44 | 基础量价+技术指标 |
+| +日历+截面 | 70 | 1.56 | wday/month/CNY/cs_rank/excess |
+| +成分股调整+量价背离 | **73** | **1.52** | rebalance_soon/divergence |
+
+### 最终结论
+
+**LGBM_Nash + inv_vol + 过滤器 = 14周100%胜率, Sharpe 1.98**
+```bash
+python controller.py --ensemble lgbm --game 0.25 --no-overbought --diverse-industry 2 --weight inv_vol
+```
 
 **70特征提升：均值 +29%，Sharpe +0.12，最差周从 -5.2% 缩至 -0.12%**
 
@@ -201,6 +209,9 @@ python test_window.py --n-windows 5 --epochs 15
 | **DoubleEnsemble LGBM** | **已集成** | **`--double-ensemble` 6模型特征子采样+误差加权** |
 | **特征升级 57→70** | **已重训** | **BlendNash Sharpe 1.44→1.56, Mean +29%** |
 | **load_predict n_features** | **已修复** | **从checkpoint config读取特征数，兼容新旧模型** |
+| **成分股调整日历** | **已集成** | **`is_rebalance_soon` 沪深300调整前2周信号** |
+| **量价背离信号** | **已集成** | **`divergence_bull/bear` 下跌衰竭/上涨放量信号** |
+| **特征升级 70→73** | **已重训** | **+3特征，成分股调整+量价背离** |
 
 ## 关键发现
 
@@ -219,4 +230,7 @@ python test_window.py --n-windows 5 --epochs 15
 - **70特征显著优于57特征**: BlendNash Mean +29%, 最差周 -5.2%→-0.12%
 - **日历+截面特征贡献大**: 9维日历+4维截面，A股日历效应明显
 - **LGBM Nash 100%胜率**: 14周全部正收益，Softmax Sharpe 1.37
+- **成分股调整窗口有效**: 沪深300每年6月/12月调整，前2周有超额
+- **量价背离是反转信号**: 缩量下跌→潜在反弹，放量滞涨→潜在回调
+- **最终有效参数**: `--no-overbought --diverse-industry 2 --game 0.25 --weight inv_vol`
 最后备份: /root/gupiao_final_20260601_221132

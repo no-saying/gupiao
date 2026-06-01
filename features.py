@@ -256,6 +256,15 @@ def add_cross_sectional_features(panel: pd.DataFrame) -> pd.DataFrame:
     if "volume" in panel.columns:
         panel["cs_rank_volume"] = panel.groupby("date")["volume"].rank(pct=True)
 
+    # 量价背离信号: 价格跌3天但成交量持续萎缩 → 下跌动能衰减(潜在反转)
+    if all(c in panel.columns for c in ("close", "volume")):
+        ret_3d = panel.groupby("stock_id")["close"].transform(lambda x: x.pct_change(3))
+        vol_ma5 = panel.groupby("stock_id")["volume"].transform(lambda x: x.rolling(5).mean())
+        vol_ratio = panel["volume"] / vol_ma5.replace(0, np.nan)
+        # 背离 = price下跌(负) AND volume萎缩(vol_ratio<0.8)
+        panel["divergence_bull"] = ((ret_3d < -0.02) & (vol_ratio < 0.8)).astype(np.float32)
+        panel["divergence_bear"] = ((ret_3d > 0.02) & (vol_ratio > 1.5)).astype(np.float32)
+
     return panel
 
 
@@ -301,6 +310,21 @@ def add_calendar_features(panel: pd.DataFrame) -> pd.DataFrame:
         after_mask = (dates > cny) & (dates <= cny + cny_window)
         df.loc[before_mask, "is_cny_before"] = 1.0
         df.loc[after_mask, "is_cny_after"] = 1.0
+
+    # ── 沪深300成分股调整日历（6月/12月） ──
+    # 调整生效前2周=预期炒作窗口，生效前后=被动资金调仓
+    import datetime
+    rebalance_dates = [
+        "2021-06-11", "2021-12-10", "2022-06-10", "2022-12-09",
+        "2023-06-09", "2023-12-08", "2024-06-14", "2024-12-13",
+        "2025-06-13", "2025-12-12", "2026-06-12", "2026-12-11",
+    ]
+    rebalance_dates = pd.to_datetime(rebalance_dates)
+    reb_window = pd.Timedelta(days=14)  # 调整前2周
+    df["is_rebalance_soon"] = 0.0
+    for rd in rebalance_dates:
+        mask = (dates >= rd - reb_window) & (dates < rd)
+        df.loc[mask, "is_rebalance_soon"] = 1.0
 
     return df.set_index(["date", "stock_id"])
 
