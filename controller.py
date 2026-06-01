@@ -652,8 +652,81 @@ def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
 
     sel_sc = np.array(sel_sc)
 
-    # 加权
-    if args.weight == "equal":
+    # ── 置信度建模（模型集成方差 → 减仓） ──
+    if getattr(args, 'confidence', False) and stock_idx_map is not None and X_lt is not None:
+        try:
+            n_models_avail = sum(1 for w in GP_WEIGHTS.values() if w > 0)
+            if n_models_avail >= 4:
+                all_preds = []
+                for name, w in GP_WEIGHTS.items():
+                    if w > 0:
+                        seed, fold = name.split("_f")
+                        p = load_predict(MODEL_DIR / f"portfolio_model_{seed}_v2_fold{fold}.pt", X_lt, 57)
+                        all_preds.append(p)
+                all_preds = np.array(all_preds)
+                idxs = [stock_idx_map[s] for s in sel_ids]
+                var_per_stock = np.var(all_preds[:, idxs], axis=0)
+                mean_var = float(np.mean(var_per_stock))
+                # 方差 > 0.05 表示模型间分歧大 → 减仓
+                if mean_var > 0.05:
+                    cash_pct = min(0.3, mean_var * 2)
+                    print(f"  Confidence: var={mean_var:.4f} → {cash_pct*100:.0f}% cash")
+                    sel_sc = sel_sc * (1.0 - cash_pct)
+        except Exception as e:
+            print(f"  [warn] confidence: {e}")
+
+    # 加权 (HRP 优先于其他方法)
+    if getattr(args, 'hrp', False):
+        # 层次风险平价 (HRP): 基于 embedding 聚类树分配权重
+        try:
+            from scipy.cluster.hierarchy import linkage, fcluster
+            from scipy.spatial.distance import squareform
+            if stock_idx_map is not None and X_lt is not None:
+                from model import PortfolioPredictor
+                ckpt = torch.load(MODEL_DIR / "portfolio_model_g791_v2_fold1.pt", map_location='cpu', weights_only=False)
+                fm_n = np.array(ckpt["feat_mean"]).reshape(1,1,1,-1)
+                fs_n = np.array(ckpt["feat_std"]).reshape(1,1,1,-1)
+                X_n = (X_lt.astype(np.float32) - fm_n) / fs_n
+                X_t = torch.from_numpy(X_n).to(DEVICE, dtype=torch.float32)
+                m_t = torch.ones(1, 300, device=DEVICE)
+                model_e = PortfolioPredictor(n_features=X_lt.shape[-1],
+                    d_model=ckpt["config"].get("d_model",128),
+                    use_market_gate=ckpt["config"].get("use_market_gate", False))
+                model_e.load_state_dict(ckpt["model_state_dict"])
+                model_e.to(DEVICE); model_e.eval()
+                with torch.no_grad():
+                    emb = model_e.encode_stocks(X_t, m_t).squeeze(0).cpu().numpy()
+                idxs = np.array([stock_idx_map[s] for s in sel_ids])
+                e = emb[idxs]
+                # 距离矩阵 → 层次聚类 → HRP 权重
+                corr = np.corrcoef(e)
+                dist = np.sqrt(2 * (1 - np.clip(corr, -1, 1)))
+                dist = np.nan_to_num(dist, nan=0.0)
+                dist = (dist + dist.T) / 2  # 确保对称
+                links = linkage(squareform(dist), method='ward')
+                # 沿聚类树逆序分配: 方差大的子簇权重低
+                from scipy.cluster.hierarchy import leaves_list
+                order = leaves_list(links)
+                # 计算波动率倒数作为降序权重
+                hrp_vols = []
+                for sid in sel_ids:
+                    try:
+                        v = float(panel.xs(sid, level="stock_id")["pctChg"].std()) / 100.0
+                    except:
+                        v = 0.03
+                    hrp_vols.append(max(v, 0.005))
+                inv_vols = np.array([1.0 / v for v in hrp_vols])
+                weights = np.zeros(len(sel_ids))
+                for i, idx in enumerate(order):
+                    weights[idx] = inv_vols[i] if len(inv_vols) > i else 1.0
+                weights = weights / weights.sum()
+                print(f"  HRP weights: {['{:.3f}'.format(w) for w in weights]}")
+            else:
+                weights = np.ones(len(sel_ids)) / len(sel_ids)
+        except Exception as e:
+            print(f"  [warn] HRP failed: {e}, fallback equal")
+            weights = np.ones(len(sel_ids)) / len(sel_ids)
+    elif args.weight == "equal":
         weights = np.ones(len(sel_ids)) / len(sel_ids)
     elif args.weight == "softmax":
         x = np.array(sel_sc) - max(sel_sc)
@@ -723,6 +796,10 @@ def main():
                         help="极限分数模式: softmax+无过滤器+game智能调节")
     parser.add_argument("--moe", action="store_true",
                         help="动态MoE融合: HMM市场状态自适应LGBM/NN权重")
+    parser.add_argument("--confidence", action="store_true",
+                        help="置信度建模: 模型集成方差高时自动减仓")
+    parser.add_argument("--hrp", action="store_true",
+                        help="层次风险平价: 基于NN embedding聚类分配权重")
 
     args = parser.parse_args()
 
