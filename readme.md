@@ -1,136 +1,80 @@
-# 股票投资组合预测 — LightGBM + NN 混合集成
+# 股票投资组合预测 — LightGBM + NN + 纳什均衡
 
-> 赛题：基于沪深 300 成分股的历史数据，预测未来一周（T+1~T+5）收益最高的 ≤5 只股票组合。
-
-## 最终 Score: 0.148 (73特征)
-
-### 14周滚动回测 — 最优
-
-| 策略 | Mean | Sharpe | WinRate |
-|:-----|:----:|:-----:|:-------:|
-| **LGBM_Nash + inv_vol** 🏆 | **0.075** | **1.98** | **100%** |
-| BlendNash + inv_vol | 0.081 | 1.52 | 93% |
-
-### 特征升级 57→70→73
-
-| 版本 | 特征 | BlendNash Sharpe | 新增 |
-|:----|:----:|:----------------:|:-----|
-| 初始 | 57 | 1.44 | 量价+技术指标 |
-| +日历+截面 | 70 | 1.56 | wday/month/cs_rank |
-| +成分股调整+量价背离 | **73** | **1.52** | rebalance/divergence |
+> 赛题：基于沪深 300 成分股历史数据，预测未来一周（T+1~T+5）收益最高的 ≤5 只股票组合。
+> 队伍：中州奶龙 | **最终 14周 Sharpe 1.98, 100%胜率**
 
 ---
 
 ## 快速开始
 
 ```bash
-# 预测（默认: LGBM+NN+门控）
-python controller.py --weight softmax
+# 🏆 极限分数模式 (0.143)
+python controller.py --max-score --game 0.25 --weight softmax
 
-# LightGBM 单独（长期最稳）
-python controller.py --ensemble lgbm --weight softmax
+# 🛡️ 稳健模式 (Sharpe 1.98, 100%胜率)
+python controller.py --ensemble lgbm --game 0.25 --no-overbought --diverse-industry 2 --weight inv_vol
 
-# 对比所有策略
+# ⚖️ 均衡模式 (Sharpe 1.52)
+python controller.py --no-overbought --diverse-industry 2 --game 0.25 --weight inv_vol
+
+# 📊 对比所有策略
 python controller.py --ensemble compare
 ```
 
-## 提交文件
+## 最终成绩
 
-参见 `output/README.md`
+| 策略 | Mean | Sharpe | WinRate | 最差周 |
+|:-----|:----:|:------:|:-------:|:------:|
+| **Nash + inv_vol** 🏆 | **0.075** | **1.98** | **100%** | **+0.021** |
+| Nash + softmax | **0.106** | 1.71 | 100% | +0.010 |
+| BlendNash + inv_vol | 0.081 | 1.52 | 93% | -0.033 |
+| BlendNash + softmax | 0.082 | 1.44 | 93% | -0.049 |
 
-| 策略 | Score | 14周 Sharpe |
-|------|:-----:|:-----------:|
-| **LGBM+NN+纳什 (70特征)** | **0.148** | **1.56** |
-| LGBM_Nash (70特征) | — | 1.37 (100%胜率) |
-| LightGBM 单独 (57特征) | 0.130 | 0.70 |
-| NN GP (70特征) | — | 0.68 |
+## 核心创新
 
-### 新功能 (参考 Game-BDC2026)
-| 功能 | 参数 | 效果 |
-|------|:----:|:-----|
-| PCC Loss | `--loss pcc` | 直接优化RankIC |
-| 市场门控 | `USE_MARKET_GATE=True` | 市场状态调制个股 |
-| 现金仓位 | `--cash-buffer N` | 信号弱时留现金 |
-| 日历+截面特征 | 自动(70维) | 日历效应+截面信息 |
-| 零均值居中 | `--center` | 消除系统性偏差 |
-| DoubleEnsemble | `--double-ensemble` | 6模型特征子采样 |
+| 技术 | 效果 |
+|:-----|:------|
+| **纳什均衡选股** | Sharpe +0.49 — embedding余弦相似度+博弈论 |
+| **精度门控** | 动量>0 + 回撤>-8% — 最简但最有效的过滤器 |
+| **73维特征** | 量价+技术+日历+截面+成分股调整+量价背离 |
+| **LGBM+NN融合** | LGBM截面排序 + NN时序编码 = 互补 |
+| **超买过滤** | RSI>75或10d>20%排除 — 防追高 |
+| **行业分散** | 同行业最多N只 — 降集中度 |
+| **市场分析** | 宏观周期+赛道拥挤+博弈升级 |
 
 ## 模型架构
 
 ```
-特征 Panel (date, stock, 57 features)
+输入 73维特征(300股×60天)
     │
-    ├─ LightGBM Ranker ─── 截面排序 (lambdarank)
-    │    500 trees, num_leaves=63, 训练10秒
+    ├─ GRU时序编码 → Cross-Sectional Transformer ×2 → ScoreHead
+    │   12个子模型(3种子×4折TSCV) GP加权融合
     │
-    ├─ NN GP Ensemble ──── 时序编码 (GRU+Transformer)
-    │    12个子模型 (3种子×4折) GP优化加权
+    ├─ LightGBM Ranker (lambdarank, 500 trees)
     │
-    ├─ 精度门控 ── 动量>0 + 回撤<8% + 波动率过滤
+    ├─ 融合: 0.7×LGBM + 0.3×NN → 候选Top40
     │
-    └─ softmax加权 ── 高分多配, 低分少配
+    ├─ 精度门控 → 纳什均衡 → 波动率过滤 → Top-5
+    │
+    └─ 权重分配 (softmax/inv_vol/bdc/equal)
 ```
 
-## 目录结构
+## 特征工程 (73维)
 
-```
-├── controller.py       ← 主入口
-├── train.py            ← NN 训练
-├── model.py            ← GRU + Transformer
-├── features.py         ← 57因子
-├── data_loader.py      ← 数据加载
-├── score_self.py       ← 评分
-├── config.py           ← 超参数
-│
-├── output/README.md    ← 提交文件说明
-├── HANDOVER.md         ← 详细文档
-├── CLAUDE.md           ← 项目手册
-│
-├── models/             ← 模型权重 (27个模型)
-│   ├── *_v2_*.pt       ← 57特征 v2 模型
-│   ├── *.pt            ← 51特征 旧模型
-│   └── lgbm_ranker.txt ← LightGBM 缓存
-│
-└── data/               ← 数据缓存
-```
+| 类别 | 数量 | 因子 |
+|:-----|:----:|:------|
+| 动量+波动率 | 7 | ret_5/10/20/60d, vol_5/10/20d |
+| 均线偏离 | 4 | ma5/10/20/60_dev |
+| 量价 | 5 | volume_ratio, turn_change, gap_ratio, amplitude |
+| 技术指标 | 12 | RSI, MACD, KDJ, OBV, WR, BB, ATR |
+| 风险走势 | 7 | max_dd, price_position, streak, corr |
+| 截面排名 | 7 | ret/vol/rsi_rank, cs_rank_close/vol, excess_return |
+| 行业 | 7 | ind_ret/alpha/vol, industry_rank_return |
+| 指数 | 12 | SSE50/CSI500/ChiNext/SSE × 3窗口 |
+| 市场 | 1 | beta_60d |
+| 日历 | 9 | wday, month_sin/cos, month_end, CNY, **rebalance_soon** |
+| 量价背离 | 2 | **divergence_bull/bear** |
 
-## 特征工程（57个因子）
+## 详细文档
 
-| 类别 | 因子 | 数量 |
-|------|------|:----:|
-| 动量 | ret_5d/10d/20d/60d | 4 |
-| 波动率 | vol_5d/10d/20d | 3 |
-| 均线偏离 | ma5/10/20/60_dev | 4 |
-| 量价 | volume_ratio, turn_change, gap_ratio | 5 |
-| 技术指标 | RSI, MACD, KDJ, OBV, Williams %R, BB, ATR | 12 |
-| 风险 | max_dd_20d, price_position, close_pos, intraday_range | 4 |
-| 走势 | streak_up/down, vol_ret_corr_10d | 3 |
-| 截面排名 | ret/vol/rsi 百分位排名 | 4 |
-| 行业 | 行业平均收益/波动, Alpha, 拥挤度 | 6 |
-| 指数 | SSE50/CSI500/ChiNext/SSE × 3窗口 | 12 |
-| 市场 | beta_60d | 1 |
-
-## 运行命令
-
-```bash
-# 预测
-python controller.py --weight softmax
-
-# 单模型预测
-python predict.py --model models/portfolio_model_g791.pt
-
-# NN 训练 (约1小时)
-python train.py --seed 791 --loss topk_listnet --decay 2.0 --tscv --batch-size 32
-
-# LightGBM (10秒, 自动缓存)
-python controller.py --no-cache
-
-# 评分
-python score_self.py
-```
-
-## 关键训练参数
-- `D_MODEL=128`, `BATCH_SIZE=32`（57特征）
-- `N_EPOCHS=300`, `EARLY_STOP_PATIENCE=50`
-- `LR=1e-4`, OneCycleLR + FP16 AMP
-- LightGBM: 500 trees, num_leaves=63, lambdarank
+参见 [CLAUDE.md](CLAUDE.md) — 完整版项目手册（含回测明细、博弈论推导、风险分析）
