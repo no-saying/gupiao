@@ -2,7 +2,14 @@
 
 > 赛题：基于沪深 300 成分股的历史数据，预测未来一周（T+1~T+5）收益最高的 ≤5 只股票组合。
 
-## 最终 Score: 0.149 (LGBM+NN+门控+softmax)
+## 最终 Score: 0.148 (70特征) / 0.149 (57特征)
+
+### 14周滚动回测 (LGBM_NN_BlendNash softmax)
+
+| 版本 | Mean | Sharpe | WinRate | 最差周 |
+|:----|:---:|:-----:|:-------:|:------:|
+| **70特征** | **0.0933** | **1.56** | 85.7% | **-0.001** |
+| 57特征 | 0.0725 | 1.44 | 92.9% | -0.052 |
 
 ---
 
@@ -23,14 +30,22 @@ python controller.py --ensemble compare
 
 参见 `output/README.md`
 
-| 文件 | 策略 | 本周 Score | 长期 Sharpe |
-|------|------|:----------:|:-----------:|
-| `result_lgbm_nn.csv` | LGBM+NN+门控 | **0.149** | — |
-| `result_lgbm.csv` | LightGBM 单独 | 0.130 | **1.19** |
-| `result_nash.csv` | +纳什均衡 | 0.149 | — |
-| `result_gp.csv` | NN GP v2 | 0.059 | 0.31 |
-| `result_fold1.csv` | old fold1 | 0.127 | 0.06 |
-| `result_3model.csv` | old 3model | 0.107 | 0.12 |
+| 策略 | Score | 14周 Sharpe |
+|------|:-----:|:-----------:|
+| **LGBM+NN+纳什 (70特征)** | **0.148** | **1.56** |
+| LGBM_Nash (70特征) | — | 1.37 (100%胜率) |
+| LightGBM 单独 (57特征) | 0.130 | 0.70 |
+| NN GP (70特征) | — | 0.68 |
+
+### 新功能 (参考 Game-BDC2026)
+| 功能 | 参数 | 效果 |
+|------|:----:|:-----|
+| PCC Loss | `--loss pcc` | 直接优化RankIC |
+| 市场门控 | `USE_MARKET_GATE=True` | 市场状态调制个股 |
+| 现金仓位 | `--cash-buffer N` | 信号弱时留现金 |
+| 日历+截面特征 | 自动(70维) | 日历效应+截面信息 |
+| 零均值居中 | `--center` | 消除系统性偏差 |
+| DoubleEnsemble | `--double-ensemble` | 6模型特征子采样 |
 
 ## 模型架构
 
