@@ -65,7 +65,7 @@ from config import (
 )
 from data_loader import get_official_stock_ids, build_panel_from_official
 from features import engineer_features, make_window_samples, get_norm_stats
-from model import PortfolioPredictor, lambdarank_loss, pairwise_ranking_loss, listnet_loss, topk_listnet_loss, pcc_loss
+from model import PortfolioPredictor, lambdarank_loss, pairwise_ranking_loss, listnet_loss, topk_listnet_loss, pcc_loss, sharpe_loss
 
 
 # =============================================================================
@@ -423,6 +423,7 @@ def train_model(
         "listnet": listnet_loss,
         "topk_listnet": topk_listnet_loss,
         "pcc": pcc_loss,
+        "sharpe": sharpe_loss,
     }
     loss_fn = loss_map.get(loss_name, listnet_loss)
 
@@ -703,7 +704,7 @@ def main():
                         help="强制重新下载所有数据（清除缓存）")
     parser.add_argument("--epochs", type=int, default=N_EPOCHS,
                         help=f"训练轮数（默认: {N_EPOCHS}）")
-    parser.add_argument("--loss", choices=["lambdarank", "pairwise", "listnet", "topk_listnet", "pcc"],
+    parser.add_argument("--loss", choices=["lambdarank", "pairwise", "listnet", "topk_listnet", "pcc", "sharpe"],
                         default="listnet",
                         help="损失函数: lambdarank/pairwise/listnet(推荐)/topk_listnet")
     parser.add_argument("--lr", type=float, default=LR,

@@ -269,6 +269,45 @@ def add_cross_sectional_features(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
+# 微观结构特征 (Micro-structure Proxies)
+# =============================================================================
+
+def add_micro_structure_features(panel: pd.DataFrame) -> pd.DataFrame:
+    """添加微观结构代理因子：流动性、偏度、峰度、小波分解。
+
+    仅使用 OHLCV，不依赖外部数据。
+    """
+    # 1. Amihud 缺乏流动性指标: |Return| / Volume (×1e9 缩放)
+    if all(c in panel.columns for c in ("pctChg", "volume")):
+        ret_abs = panel["pctChg"].abs() / 100.0  # 转小数
+        vol_safe = panel["volume"].replace(0, np.nan)
+        panel["amihud_illiq"] = (ret_abs / vol_safe).fillna(0).astype(np.float32)
+
+    # 2. 偏度 (Skewness): 过去20日收益率的偏度，反映"彩票型"偏好
+    if "pctChg" in panel.columns:
+        skew_20d = panel.groupby("stock_id")["pctChg"].transform(
+            lambda x: x.rolling(20).skew())
+        panel["ret_skew_20d"] = skew_20d.fillna(0).astype(np.float32)
+
+    # 3. 峰度 (Kurtosis): 过去20日收益率的峰度，反映厚尾风险
+    if "pctChg" in panel.columns:
+        kurt_20d = panel.groupby("stock_id")["pctChg"].transform(
+            lambda x: x.rolling(20).kurt())
+        panel["ret_kurt_20d"] = kurt_20d.fillna(0).astype(np.float32)
+
+    # 4. 高低价差比 (Corwin-Schultz 简化版): (High - Low) / Close
+    if all(c in panel.columns for c in ("high", "low", "close")):
+        spread_hl = (panel["high"] - panel["low"]) / panel["close"].replace(0, np.nan)
+        panel["hl_spread"] = spread_hl.fillna(0).astype(np.float32)
+        # 20日均值
+        spread_ma20 = panel.groupby("stock_id")["hl_spread"].transform(
+            lambda x: x.rolling(20).mean())
+        panel["hl_spread_20d"] = spread_ma20.fillna(0).astype(np.float32)
+
+    return panel
+
+
+# =============================================================================
 # 日历特征（A股日历效应）
 # =============================================================================
 
@@ -506,6 +545,9 @@ def engineer_features(panel: pd.DataFrame, stock_ids: list[str] | None = None) -
 
     print("[features] Adding cross-sectional rank features ...")
     panel = add_cross_sectional_features(panel)
+
+    print("[features] Adding micro-structure features ...")
+    panel = add_micro_structure_features(panel)
 
     print("[features] Adding calendar features ...")
     panel = add_calendar_features(panel)

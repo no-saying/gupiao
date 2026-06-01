@@ -851,3 +851,60 @@ def pcc_loss(
         return torch.tensor(0.0, device=device)
 
     return torch.stack(losses).mean()
+
+
+# ── 损失 7: Differentiable Sharpe Ratio ─────────────────────
+
+def sharpe_loss(
+    scores: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    temperature: float = 1.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    可微夏普比率损失 — 直接优化投资组合的夏普比率。
+
+    核心思想：
+      1. 将 scores 通过 softmax 转为组合权重 w（加权者可视为资金分配）
+      2. 计算该组合在 batch 内的预期收益 μ 和方差 σ²
+      3. Loss = -μ / σ  （最大化夏普）
+
+    这比 LambdaRank 更直接地优化"收益最高且控回撤"的目标。
+
+    参考: Differentiable Sharpe Ratio, Zhang et al. 2020
+    """
+    if valid_mask is None:
+        valid_mask = torch.ones_like(targets)
+
+    B, N = scores.shape
+    device = scores.device
+    losses = []
+
+    for i in range(B):
+        valid_idx = (valid_mask[i] > 0.5).nonzero(as_tuple=True)[0]
+        n_valid = len(valid_idx)
+        if n_valid < 5:
+            continue
+
+        s = scores[i, valid_idx]
+        t = targets[i, valid_idx]
+
+        # softmax → 组合权重（高温=更均匀，低温=更集中）
+        w = torch.softmax(s / temperature, dim=0)
+
+        # 组合收益 = weighted return
+        port_ret = (w * t).sum()
+
+        # 组合方差 = w' Σ w（用截面收益的 pairwise 差异近似）
+        t_center = t - t.mean()
+        # 用单个样本内收益的标准差作为风险度量
+        port_std = (w * (t_center ** 2)).sum().sqrt() + eps
+
+        sharpe = port_ret / port_std
+        losses.append(-sharpe)  # 负号：最小化负夏普 = 最大化夏普
+
+    if not losses:
+        return torch.tensor(0.0, device=device)
+
+    return torch.stack(losses).mean()
