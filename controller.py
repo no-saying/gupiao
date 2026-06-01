@@ -422,7 +422,7 @@ def bdc_select_and_weight(pool_ids, pool_sc, panel, top_k=5, risk_penalty=0.30,
 
 def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
                              panel, args, n_features=57, stock_idx_map=None,
-                             X_lt=None, nash_mode="embedding"):
+                             X_lt=None):
     """原有的精度门控+波动率过滤+选股权重逻辑。"""
     # ── 精度门控 + 超买过滤 ──
     precision_ids, psc = [], []
@@ -463,7 +463,7 @@ def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
         try:
             precision_ids, psc = nash_equilibrium_selection(
                 precision_ids, psc, stock_idx_map, panel, X_lt, lam,
-                n_features=actual_n_features, mode=nash_mode)
+                n_features=actual_n_features)
         except Exception as e:
             print(f"  [WARN] Nash failed: {e}")
 
@@ -653,9 +653,8 @@ def main():
         latest_date = sorted(lgbm_df['date'].unique())[-1]
         model_path = MODEL_DIR / "lgbm_ranker.txt"
         if args.no_cache and model_path.exists(): model_path.unlink()
-        lgbm_result = train_lgbm_ranker(lgbm_df, feat_cols, model_path,
-                                         double_ensemble=args.double_ensemble)
-        if args.double_ensemble:
+        lgbm_result = train_lgbm_ranker(lgbm_df, feat_cols, model_path)
+        if False:  # double_ensemble disabled
             lgbm_model, lgbm_fm, lgbm_fs, lgbm_rankic, _ = lgbm_result
         else:
             lgbm_model, lgbm_fm, lgbm_fs, lgbm_rankic = lgbm_result
@@ -809,7 +808,7 @@ def main():
                 print("  [WARN] Hybrid pipeline returned no candidates, falling back to legacy")
                 sel_ids, weights = legacy_select_and_weight(
                     pool_ids, pool_sc, pool, valid, scores, stock_ids, panel, args,
-                    stock_idx_map=stock_idx_map, X_lt=X_lt, nash_mode=args.nash_mode)
+                    stock_idx_map=stock_idx_map, X_lt=X_lt)
         else:
             print("  Using BDC-style pipeline (risk-filter + risk-adjusted rerank + pred-weights)...")
             sel_ids, weights = bdc_select_and_weight(
@@ -820,12 +819,12 @@ def main():
                 print("  [WARN] BDC pipeline returned no candidates, falling back to legacy")
                 legacy_ids, legacy_weights = legacy_select_and_weight(
                     pool_ids, pool_sc, pool, valid, scores, stock_ids, panel, args,
-                    stock_idx_map=stock_idx_map, X_lt=X_lt, nash_mode=args.nash_mode)
+                    stock_idx_map=stock_idx_map, X_lt=X_lt)
                 sel_ids, weights = legacy_ids, legacy_weights
     else:
         sel_ids, weights = legacy_select_and_weight(
             pool_ids, pool_sc, pool, valid, scores, stock_ids, panel, args,
-            stock_idx_map=stock_idx_map, X_lt=X_lt, nash_mode=args.nash_mode)
+            stock_idx_map=stock_idx_map, X_lt=X_lt)
 
     # ── 自适应现金仓位 ──（选股后、输出前）
     if args.cash_buffer is not None and args.cash_buffer > 0 and len(weights) > 0:
@@ -888,13 +887,11 @@ def main():
             _w = csv.writer(_f)
             if not _log_exists:
                 _w.writerow(["timestamp","score","ensemble","weight","game",
-                             "nash_mode","bdc","multi_day","stocks","n"])
+                             "multi_day","stocks","n"])
             _w.writerow([
                 time.strftime("%Y-%m-%d %H:%M:%S"),
                 f"{score:.6f}", args.ensemble, args.weight,
                 args.game if args.game is not None else "",
-                getattr(args, 'nash_mode', ''),
-                args.bdc if args.bdc else "",
                 getattr(args, 'multi_day', 1),
                 " ".join([str(s) for s in sel_ids]),
                 len(sel_ids),
@@ -914,7 +911,7 @@ def main():
         # 计算旧管线结果
         legacy_ids, legacy_weights = legacy_select_and_weight(
             pool_ids, pool_sc, pool, valid, scores, stock_ids, panel, args,
-            stock_idx_map=stock_idx_map, X_lt=X_lt, nash_mode=args.nash_mode)
+            stock_idx_map=stock_idx_map, X_lt=X_lt)
         legacy_out = pd.DataFrame({"股票代码": [str(s).zfill(6) for s in legacy_ids], "权重": legacy_weights})
         legacy_out.to_csv(legacy_result_path, index=False)
 
