@@ -250,6 +250,87 @@ class CrossSectionalTransformer(nn.Module):
 
 
 # =============================================================================
+# 图注意力网络 GAT (Graph Attention Network) — 替代 Transformer
+# =============================================================================
+
+class GraphAttentionLayer(nn.Module):
+    """
+    图注意力层：用动态邻接矩阵（股票相关性）做消息传递。
+
+    与 Transformer 的区别：
+      - Transformer: 全连接注意力（所有股票两两计算）
+      - GAT: 只对"邻居"股票做注意力（邻接矩阵稀疏化）
+      - 优势：引入相关性先验，更符合"板块联动"的实际情况
+    """
+
+    def __init__(self, d_model: int, n_heads: int = 4, dropout: float = DROPOUT,
+                 top_k: int = 20):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.top_k = top_k
+        self.head_dim = d_model // n_heads
+        assert self.head_dim * n_heads == d_model
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 2, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, N, D = x.shape
+
+        # 计算动态邻接矩阵：用余弦相似度 + top-k 稀疏化
+        x_norm = x / (x.norm(dim=-1, keepdim=True) + 1e-8)
+        adj = x_norm @ x_norm.transpose(-2, -1)  # (B, N, N) 相似度
+
+        # mask 处理
+        if mask is not None:
+            mask_3d = mask.unsqueeze(1).expand(-1, N, -1)
+            adj = adj * mask_3d * mask_3d.transpose(-2, -1)
+
+        # top-k 稀疏: 只保留每个节点最相关的 top_k 个邻居
+        topk = min(self.top_k, N - 1)
+        _, idx = torch.topk(adj, topk + 1, dim=-1)  # +1 包括自己
+        adj_sparse = torch.zeros_like(adj)
+        adj_sparse.scatter_(-1, idx, 1.0)
+        adj = adj * adj_sparse  # 保留 top-k 的相似度，其余置 0
+
+        # Multi-head QKV
+        Q = self.q_proj(x).reshape(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+        K = self.k_proj(x).reshape(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(x).reshape(B, N, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # 注意力
+        attn = Q @ K.transpose(-2, -1) / (self.head_dim ** 0.5)
+        # 应用邻接矩阵 mask（只在邻居间传播）
+        adj_exp = adj_sparse.unsqueeze(1).expand(-1, self.n_heads, -1, -1)
+        attn = attn.masked_fill(adj_exp == 0, float('-inf'))
+
+        if mask is not None:
+            attn = attn.masked_fill(mask.unsqueeze(1).unsqueeze(2) == 0, float('-inf'))
+
+        attn_weights = torch.softmax(attn, dim=-1)
+        out = (attn_weights @ V).transpose(1, 2).reshape(B, N, D)
+        out = self.out_proj(out)
+
+        # Pre-LN 残差
+        x = x + out
+        x = x + self.ffn(self.norm(x))
+
+        return x, attn_weights.mean(dim=1)  # (B, N, N) 平均注意力
+
+
+# =============================================================================
 # 市场门控：用全市场平均表征调制个股
 # =============================================================================
 
@@ -329,10 +410,12 @@ class PortfolioPredictor(nn.Module):
                  n_gru_layers: int = N_GRU_LAYERS, d_ff: int = D_FF,
                  dropout: float = DROPOUT,
                  use_attention: bool = False,
-                 use_market_gate: bool = False):
+                 use_market_gate: bool = False,
+                 use_gat: bool = False):
         super().__init__()
         self.d_model = d_model
         self.use_market_gate = use_market_gate
+        self.use_gat = use_gat
 
         self.time_encoder = TimeEncoder(n_features, d_model, n_gru_layers, dropout, use_attention)
 
@@ -340,11 +423,17 @@ class PortfolioPredictor(nn.Module):
         if use_market_gate:
             self.market_gate = MarketGate(d_model)
 
-        # 堆叠多层 Transformer
-        self.transformers = nn.ModuleList([
-            CrossSectionalTransformer(d_model, n_heads, d_ff, dropout)
-            for _ in range(n_transformer_layers)
-        ])
+        # 截面注意力层: Transformer(默认) 或 GAT
+        if use_gat:
+            self.transformers = nn.ModuleList([
+                GraphAttentionLayer(d_model, n_heads, dropout)
+                for _ in range(n_transformer_layers)
+            ])
+        else:
+            self.transformers = nn.ModuleList([
+                CrossSectionalTransformer(d_model, n_heads, d_ff, dropout)
+                for _ in range(n_transformer_layers)
+            ])
 
         # 评分头：将 d_model 维的股票表示映射为一个标量分数
         self.score_head = nn.Sequential(

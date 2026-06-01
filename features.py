@@ -295,7 +295,39 @@ def add_micro_structure_features(panel: pd.DataFrame) -> pd.DataFrame:
             lambda x: x.rolling(20).kurt())
         panel["ret_kurt_20d"] = kurt_20d.fillna(0).astype(np.float32)
 
-    # 4. 高低价差比 (Corwin-Schultz 简化版): (High - Low) / Close
+    # 4. 小波分解特征 (Wavelet): 价格序列的趋势/噪声比
+    if "close" in panel.columns:
+        try:
+            import pywt
+            def _wavelet_features(series):
+                x = series.values[-60:].astype(np.float64)
+                x = np.nan_to_num(x, nan=0.0)
+                if len(x) < 16:
+                    return 0.0, 0.0
+                try:
+                    coeffs = pywt.dwt(x, 'db4')
+                    cA, cD = coeffs
+                    energy_total = np.sum(x ** 2) + 1e-12
+                    energy_trend = np.sum(cA ** 2)
+                    energy_noise = np.sum(cD ** 2)
+                    trend_ratio = energy_trend / energy_total
+                    noise_level = energy_noise / max(energy_trend, 1e-12)
+                    return trend_ratio, noise_level
+                except:
+                    return 0.0, 0.0
+            wavelet_feats = panel.groupby("stock_id")["close"].transform(
+                lambda x: pd.Series([_wavelet_features(x) for _ in range(len(x))], index=x.index))
+            # 拆分为两列
+            if isinstance(wavelet_feats, pd.DataFrame) and wavelet_feats.shape[1] == 2:
+                panel["wavelet_trend"] = wavelet_feats.iloc[:, 0].astype(np.float32)
+                panel["wavelet_noise"] = wavelet_feats.iloc[:, 1].astype(np.float32)
+            else:
+                panel["wavelet_trend"] = 0.0
+                panel["wavelet_noise"] = 0.0
+        except:
+            pass
+
+    # 5. 高低价差比 (Corwin-Schultz 简化版): (High - Low) / Close
     if all(c in panel.columns for c in ("high", "low", "close")):
         spread_hl = (panel["high"] - panel["low"]) / panel["close"].replace(0, np.nan)
         panel["hl_spread"] = spread_hl.fillna(0).astype(np.float32)

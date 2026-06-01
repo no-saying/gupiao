@@ -210,6 +210,7 @@ DROPOUT = 0.1
 # 时序注意力（Bahdanau，可选）
 USE_ATTENTION = False  # 已集成，需重训全量模型才能生效
 USE_MARKET_GATE = False  # 市场门控（借鉴 AAAI 2024 MASTER），需重训才能生效
+USE_GAT = False  # 图注意力网络 GAT 替代 Transformer，需重训
 
 # 截面 Transformer 层数：在股票维度做几层自注意力
 # 2 层基础 / 4 层高性能

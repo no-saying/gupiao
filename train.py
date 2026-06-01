@@ -848,7 +848,7 @@ def main():
             print(f"  [tscv] Fold {k+1}/{len(folds)}: train={len(tr_ld.dataset)} val={len(va_ld.dataset)}")
             print(f"  {'='*50}")
 
-            fold_model = PortfolioPredictor(n_features=n_features, use_attention=USE_ATTENTION, use_market_gate=USE_MARKET_GATE)
+            fold_model = PortfolioPredictor(n_features=n_features, use_attention=USE_ATTENTION, use_market_gate=USE_MARKET_GATE, use_gat=USE_GAT)
             if args.load_pretrained:
                 pt_path = Path(args.load_pretrained)
                 if pt_path.exists():
@@ -874,7 +874,7 @@ def main():
                            "n_transformer_layers": 2, "n_heads": N_HEADS,
                            "n_gru_layers": N_GRU_LAYERS, "d_ff": D_FF,
                            "use_attention": USE_ATTENTION,
-                           "use_market_gate": USE_MARKET_GATE},
+                           "use_market_gate": USE_MARKET_GATE, "use_gat": USE_GAT},
             }, fold_path)
             print(f"  [tscv] Fold {k+1} saved to {fold_path}")
 
@@ -902,7 +902,7 @@ def main():
         )
     else:
         model = PortfolioPredictor(n_features=n_features, use_attention=USE_ATTENTION,
-                                   use_market_gate=USE_MARKET_GATE)
+                                   use_market_gate=USE_MARKET_GATE, use_gat=USE_GAT)
 
     # 加载预训练编码器权重（如果有）
     if args.load_pretrained:
@@ -991,7 +991,7 @@ def main():
             "n_gru_layers": actual_n_gru_layers,
             "d_ff": actual_d_ff,
             "use_attention": USE_ATTENTION,
-            "use_market_gate": USE_MARKET_GATE,
+            "use_market_gate": USE_MARKET_GATE, "use_gat": USE_GAT,
         },
     }, model_path)
     print(f"\n  Model saved to {model_path}")

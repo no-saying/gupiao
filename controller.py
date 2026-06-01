@@ -214,7 +214,7 @@ def load_predict(path, X_np, n_features=None):
         d_model=cfg.get("d_model", 128), n_transformer_layers=cfg.get("n_transformer_layers", 2),
         n_gru_layers=cfg.get("n_gru_layers", 2), d_ff=cfg.get("d_ff", 256),
         use_attention=cfg.get("use_attention", False),
-        use_market_gate=cfg.get("use_market_gate", False))
+        use_market_gate=cfg.get("use_market_gate", False), use_gat=cfg.get("use_gat", False))
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(DEVICE); model.eval()
     fm = np.array(ckpt["feat_mean"]).reshape(1,1,1,-1)
