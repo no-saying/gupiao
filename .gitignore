@@ -2,5 +2,27 @@ __pycache__/
 *.pyc
 .venv/
 .claude/
+.vscode/
 *.swp
+*.swo
 .DS_Store
+.data/
+data/
+models/
+output/
+temp/
+result.csv
+.ipynb_checkpoints/
+
+# 临时评分文件
+tmp_score.csv
+
+# 训练日志
+train_*.log
+
+# 备份目录
+models_backup_*/
+
+# 独立子项目
+baseline/
+中州奶龙/
