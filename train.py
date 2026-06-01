@@ -61,7 +61,7 @@ from config import (
     LOOKBACK_DAYS, PREDICT_HORIZON, STEP_DAYS,
     MAX_STOCKS, TOP_K_CANDIDATES, TEMPERATURE, N_WORKERS,
     BIG_D_MODEL, BIG_N_HEADS, BIG_N_GRU_LAYERS,
-    BIG_N_TRANSFORMER_LAYERS, BIG_D_FF, USE_ATTENTION,
+    BIG_N_TRANSFORMER_LAYERS, BIG_D_FF, USE_ATTENTION, USE_MARKET_GATE,
 )
 from data_loader import get_official_stock_ids, build_panel_from_official
 from features import engineer_features, make_window_samples, get_norm_stats

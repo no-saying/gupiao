@@ -157,7 +157,8 @@ def run_selection(
         return [stock_ids[i] for i in ti], [scores_arr[i] for i in ti]
 
 
-def allocate_weights(sel_ids, sel_sc, wtype, panel, test_ts):
+def allocate_weights(sel_ids, sel_sc, wtype, panel, test_ts,
+                     cash_buffer: float | None = None):
     sc_arr = np.array(sel_sc)
     n = len(sel_ids)
     if n == 0:
@@ -198,7 +199,21 @@ def allocate_weights(sel_ids, sel_sc, wtype, panel, test_ts):
                     capped = np.clip(capped, None, cap)
             w = capped
         return w
-    return np.ones(n) / n
+    w = np.ones(n) / n
+
+    # ── 自适应现金仓位 ──
+    if cash_buffer is not None and cash_buffer > 0:
+        top_scores = np.sort(sc_arr)
+        signal_strength = top_scores[-1] - top_scores[-min(10, n)]
+        buffer_threshold = cash_buffer * float(np.std(sc_arr)) if np.std(sc_arr) > 1e-9 else 0.05
+        cash_pct = 0.0
+        if signal_strength < buffer_threshold:
+            cash_pct = 0.15
+        if signal_strength < buffer_threshold * 0.5:
+            cash_pct = 0.30
+        if cash_pct > 0:
+            w = w * (1.0 - cash_pct)
+    return w
 
 
 def main():
@@ -211,6 +226,8 @@ def main():
                         help="纳什触发最小候选数（默认12）")
     parser.add_argument("--nash-lam", type=float, default=0.25,
                         help="纳什 λ")
+    parser.add_argument("--cash-buffer", type=float, default=None,
+                        help="自适应现金仓位阈值")
     args = parser.parse_args()
 
     n_windows = 5 if args.fast else args.n_windows
@@ -347,17 +364,21 @@ def main():
                 continue
 
             for wtype in weight_types:
-                weights = allocate_weights(sel_ids, sel_sc, wtype, panel, test_ts)
+                weights = allocate_weights(
+                    sel_ids, sel_sc, wtype, panel, test_ts,
+                    cash_buffer=args.cash_buffer)
 
                 # ── 评分: 使用 score_self 风格（5天open-to-open） ──
                 score = compute_score_self(sel_ids, weights, panel, test_ts, n_days=5)
 
+                cb_label = f"CB{args.cash_buffer}" if args.cash_buffer else "NoCB"
                 all_records.append({
                     "window":       wi + 1,
                     "test_date":    str(test_date),
-                    "strategy":     sname,
+                    "strategy":     f"{sname}_{cb_label}",
                     "ensemble":     ensemble,
                     "use_nash":     int(use_nash),
+                    "cash_buffer":  args.cash_buffer or 0,
                     "weight_type":  wtype,
                     "n_stocks":     len(sel_ids),
                     "score":        round(score, 8),
@@ -376,7 +397,7 @@ def main():
 
     # 详细统计
     stats = []
-    for sname in [s[0] for s in strategies]:
+    for sname in df["strategy"].unique():
         for wtype in weight_types:
             sub = df[(df["strategy"] == sname) & (df["weight_type"] == wtype)]
             if len(sub) < 3:
@@ -403,7 +424,7 @@ def main():
 
     # 聚合
     agg = []
-    for sname in [s[0] for s in strategies]:
+    for sname in df["strategy"].unique():
         sub = df[df["strategy"] == sname]
         if len(sub) < 3:
             continue
@@ -411,7 +432,7 @@ def main():
         best_wt = sub.groupby("weight_type")["score"].mean()
         agg.append({
             "Strategy": sname,
-            "Nash": "Yes" if sub["use_nash"].iloc[0] else "No",
+            "CashBuf": sub["cash_buffer"].iloc[0],
             "N_Total":  len(sub),
             "Mean":     np.mean(sc_all),
             "Std":      np.std(sc_all),

@@ -69,6 +69,9 @@ python controller.py --bdc pure
 
 # BDC 混合管线 (精度门控 + BDC排序 + BDC权重)
 python controller.py --bdc hybrid
+
+# + 自适应现金仓位 (信号弱时保留现金)
+python controller.py --cash-buffer 0.3
 ```
 
 ### 训练
@@ -78,8 +81,14 @@ python train.py --seed 791 --loss topk_listnet --decay 2.0 --tscv --batch-size 3
 python train.py --seed 42  --loss topk_listnet --decay 2.0 --tscv --batch-size 32
 python train.py --seed 787 --loss lambdarank    --tscv --batch-size 32
 
+# PCC Loss (直接优化RankIC, 从AAAI 2024 MASTER借鉴)
+python train.py --seed 791 --loss pcc --tscv --batch-size 32
+
 # 含 Bahdanau 注意力 (需先设置 USE_ATTENTION=True in config.py)
 python train.py --seed 791 --loss topk_listnet --decay 2.0 --batch-size 32
+
+# 含市场门控 (需先设置 USE_MARKET_GATE=True in config.py)
+python train.py --seed 791 --loss pcc --tscv --batch-size 32
 ```
 
 ### 回测与验证
@@ -105,6 +114,8 @@ python test_window.py --n-windows 5 --epochs 15
 | `--topk` | 5 | 选股数量 |
 | `--no-cache` | — | 强制重训 LGBM |
 | `--output` | `output/result.csv` | 输出路径 |
+| `--loss` | `lambdarank` | 损失: lambdarank/pairwise/listnet/topk_listnet/**pcc** |
+| `--cash-buffer` | — | 自适应现金仓位阈值 (参考Game-BDC2026 T7) |
 
 ## 管线架构
 
@@ -165,12 +176,15 @@ python test_window.py --n-windows 5 --epochs 15
 | 频谱纳什多样化 | 已集成 | FFT 频谱相似度替代 NN embedding |
 | 多日 Rolling 预测 | 已集成 | `--multi-day 2~5` |
 | Bahdanau Attention | 代码已集成 | 需重训全量模型 |
-| 日志记录 | 已集成 | 自动写入 `run_log.csv` |
+| 日志记录 | 已集成 | 自动写入 `output/run_log.csv` |
 | stock_id 格式 bug | 已修复 | `int()` -> zfilled string |
 | 默认权重同步 | 已修复 | `softmax` -> `bdc` |
 | **LGBM 日期错位 bug** | **已修复** | **多日 Rolling 中 LGBM 用了无 target 的未来日导致贡献为 0** |
 | RankIC 滤波集成 | 已放弃 | 不互补反而弱 |
 | 频谱特征加入模型 | 已放弃 | 57因子已饱和 |
+| **PCC Loss** | **已集成** | **Pearson相关系数损失，直接优化RankIC** |
+| **市场门控 (Market Gate)** | **已集成** | **从embedding均值推导市场状态调制个股** |
+| **自适应现金仓位** | **已集成** | **`--cash-buffer` 信号弱时保留现金** |
 
 ## 关键发现
 
@@ -183,4 +197,7 @@ python test_window.py --n-windows 5 --epochs 15
 - **频谱纳什给出不同 signal**: 与 embedding 纳什选股结果不一致
 - **57 特征饱和**: 加频谱特征无增量
 - **数据无泄漏**: 信号逐年增强
+- **PCC Loss > 排序损失**: PCC直接优化RankIC，与LambdaRank互补
+- **现金仓位合规**: 权重和[0,1.0]允许留现金，参考Game-BDC2026 T7
+- **市场门控无需额外数据**: 从个股embedding均值推导市场状态
 最后备份: /root/gupiao_final_20260601_162504
