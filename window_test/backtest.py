@@ -78,6 +78,7 @@ def run_selection(
     stock_ids, stock_idx_map, panel,
     scores, mask, test_ts,
     use_nash=False, nash_lam=0.25, nash_min=12, n_features=57, X_lt=None,
+    no_overbought=False, diverse_industry=None, market_state=False,
 ):
     """
     选股流水线：纳什均衡 → 精度门控 → 波动率过滤 → Top-5
@@ -103,7 +104,7 @@ def run_selection(
         except Exception:
             pass
 
-    # ═══ Step 3: 精度门控 ═══
+    # ═══ Step 3: 精度门控 + 超买过滤 ═══
     precision_ids, psc = [], []
     for sid, scv in zip(pool_ids, pool_sc):
         try:
@@ -117,6 +118,17 @@ def run_selection(
                 dd = dd_series.min() if len(dd_series) > 0 else -0.01
         except Exception:
             ret_5d, dd = 0, -0.01
+
+        # 超买过滤: RSI>75 或 10日涨幅>20%
+        if no_overbought:
+            try:
+                rsi_val = float(sd_hist['rsi_14'].iloc[-1]) if 'rsi_14' in sd_hist.columns else 50
+                ret_10d = sd_hist['pctChg'].iloc[-10:].sum() / 100.0
+                if rsi_val > 75 or ret_10d > 0.20:
+                    continue
+            except:
+                pass
+
         if ret_5d > 0 and dd > -0.08:
             precision_ids.append(sid)
             psc.append(scv)
@@ -147,7 +159,42 @@ def run_selection(
             final_ids.append(sid)
             fsc.append(scv)
 
-    # ═══ Step 5: Top-K ═══
+    # ═══ Step 5: 市场状态门控（20日均线向下时切防御） ═══
+    if market_state and len(final_ids) >= 2:
+        try:
+            first_stock = panel.index.get_level_values('stock_id').unique()[0]
+            sd_ref = panel.xs(first_stock, level='stock_id')
+            sd_ref = sd_ref[sd_ref.index <= test_ts]
+            market_20d = sd_ref['pctChg'].iloc[-20:].sum() / 100.0 if len(sd_ref) >= 20 else 0
+            market_5d = sd_ref['pctChg'].iloc[-5:].mean() / 100.0 if len(sd_ref) >= 5 else 0
+            defensive_kw = ['煤炭', '石油', '公用', '银行', '电力', '交运', '钢铁', '建筑']
+            if market_20d < -0.03 and market_5d < 0:
+                def_filtered = [(s, c) for (s, c) in zip(final_ids, fsc)
+                                if any(kw in str(panel.xs(s, level='stock_id')['industry'].iloc[-1] if 'industry' in panel.columns else '') for kw in defensive_kw)]
+                if len(def_filtered) >= 2:
+                    final_ids = [s for s, c in def_filtered]
+                    fsc = [c for s, c in def_filtered]
+        except:
+            pass
+
+    # ═══ Step 6: 行业分散（同行业最多 N 只） ═══
+    if diverse_industry is not None and diverse_industry > 0 and 'industry' in panel.columns:
+        sel_ordered = sorted(zip(final_ids, fsc), key=lambda x: -x[1])
+        ind_count = {}
+        new_ids, new_sc = [], []
+        for sid, scv in sel_ordered:
+            try:
+                ind = str(panel.xs(sid, level='stock_id')['industry'].iloc[-1])
+            except:
+                ind = 'Unknown'
+            if ind_count.get(ind, 0) < diverse_industry:
+                ind_count[ind] = ind_count.get(ind, 0) + 1
+                new_ids.append(sid)
+                new_sc.append(scv)
+        if len(new_ids) >= max(2, MAX_STOCKS // 2):
+            final_ids, fsc = new_ids, new_sc
+
+    # ═══ Step 7: Top-K ═══
     if len(final_ids) >= 1:
         topk = min(MAX_STOCKS, len(final_ids))
         order = np.argsort(fsc)[-topk:]
@@ -228,6 +275,12 @@ def main():
                         help="纳什 λ")
     parser.add_argument("--cash-buffer", type=float, default=None,
                         help="自适应现金仓位阈值")
+    parser.add_argument("--no-overbought", action="store_true",
+                        help="超买过滤: RSI>75 或 10日涨幅>20%")
+    parser.add_argument("--diverse-industry", type=int, default=None,
+                        help="行业分散: 同行业最多N只")
+    parser.add_argument("--market-state", action="store_true",
+                        help="市场状态门控")
     args = parser.parse_args()
 
     n_windows = 5 if args.fast else args.n_windows
@@ -242,6 +295,7 @@ def main():
         ("NN_GP_Nash",      "gp",      True),
         ("LGBM_NN_Blend",   "lgbm-nn", False),
         ("LGBM_NN_BlendNash", "lgbm-nn", True),
+        ("Nash_Blend_Fusion","fusion", True),
     ]
     weight_types = ["equal", "softmax", "inv_vol", "bdc"]
     t0 = time.time()
@@ -347,7 +401,16 @@ def main():
             blend_arr = 0.7 * norm(lgbm_arr) + 0.3 * norm(gp_scores)
             blend_dict = {s: float(blend_arr[i]) for i, s in enumerate(stock_ids)}
 
-        sources = {"lgbm": lgbm_scores, "gp": gp_dict, "lgbm-nn": blend_dict}
+        # ── e) Fusion: LGBM_Nash(0.6) + BlendNash(0.4) 分数融合 ──
+        fs_arr = np.zeros(len(stock_ids))
+        lgbm_nash_arr = lgbm_arr if np.abs(lgbm_arr).max() >= 1e-9 else np.zeros(len(stock_ids))
+        for i, s in enumerate(stock_ids):
+            ls = norm(lgbm_nash_arr)[i]
+            bs = norm(gp_scores)[i]
+            fs_arr[i] = 0.6 * ls + 0.4 * bs
+        fusion_scores = {s: float(fs_arr[i]) for i, s in enumerate(stock_ids)}
+
+        sources = {"lgbm": lgbm_scores, "gp": gp_dict, "lgbm-nn": blend_dict, "fusion": fusion_scores}
 
         # ── d) 执行选股 → 评分 ──
         for sname, ensemble, use_nash in strategies:
@@ -359,6 +422,9 @@ def main():
                 stock_ids, stock_idx_map, panel, sd, m_win, test_ts,
                 use_nash=use_nash, nash_lam=NASH_LAM, nash_min=NASH_MIN,
                 n_features=n_features, X_lt=X_win,
+                no_overbought=args.no_overbought,
+                diverse_industry=args.diverse_industry,
+                market_state=args.market_state,
             )
             if len(sel_ids) == 0:
                 continue

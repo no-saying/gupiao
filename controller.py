@@ -231,77 +231,41 @@ def load_predict(path, X_np, n_features=None):
 # 纳什均衡选股
 # =============================================================================
 
-def _compute_spectral_similarity(candidate_ids, panel, lookback=60):
-    """
-    用 FFT 频谱替代 NN embedding 算相似度。
-    对每只股票取最近 lookback 天收益率 → FFT → 功率谱归一化 → 余弦相似度。
-    """
-    n = len(candidate_ids)
-    spectra = []
-    for sid in candidate_ids:
-        try:
-            sd = panel.xs(sid, level="stock_id")
-            ret = sd['pctChg'].iloc[-lookback:].values / 100.0
-            ret = np.nan_to_num(ret, nan=0.0, posinf=0.0, neginf=0.0)
-            if len(ret) < lookback:
-                ret = np.pad(ret, (0, lookback - len(ret)), 'constant')
-            # Hann 窗减少频谱泄漏
-            window = np.hanning(lookback)
-            ret_w = ret * window
-            # FFT 功率谱
-            spectrum = np.abs(np.fft.rfft(ret_w)) ** 2
-            # 归一化
-            s_norm = spectrum / (np.linalg.norm(spectrum) + 1e-12)
-            spectra.append(s_norm)
-        except Exception:
-            spectra.append(np.zeros(lookback // 2 + 1))
-    if not spectra:
-        return np.eye(n)
-    mat = np.array(spectra)
-    sim = mat @ mat.T  # 余弦相似度
-    return sim
-
-
 def nash_equilibrium_selection(candidate_ids, candidate_scores, stock_idx_map, panel,
-                                X_panel=None, lam=0.25, n_features=57, mode='embedding'):
+                                X_panel=None, lam=0.25, n_features=57):
     """
     在候选股中求解纯策略纳什均衡。
     效用 = 平均分数 - λ × 平均内部相似度
 
-    mode='embedding': 用 NN embedding 余弦相似度（原版）
-    mode='spectral':  用 FFT 频谱功率谱余弦相似度（无需模型）
     """
     n = len(candidate_ids)
     if n < 5:
         return candidate_ids, candidate_scores
 
-    if mode == 'spectral':
-        sim = _compute_spectral_similarity(candidate_ids, panel)
-    else:
-        # 原版：NN embedding 相似度
-        from model import PortfolioPredictor
-        seed_model = "portfolio_model_g791_v2_fold1.pt" if n_features >= 57 else "portfolio_model_g791_fold1.pt"
-        ckpt = torch.load(MODEL_DIR / seed_model, map_location=DEVICE, weights_only=False)
-        fm_n = np.array(ckpt["feat_mean"]).reshape(1,1,1,-1)
-        fs_n = np.array(ckpt["feat_std"]).reshape(1,1,1,-1)
-        X_n = (X_panel.astype(np.float32) - fm_n) / fs_n
-        X_t = torch.from_numpy(X_n).to(DEVICE, dtype=torch.float32)
-        m_t = torch.ones(1, 300, device=DEVICE)
+    # NN embedding 相似度
+    from model import PortfolioPredictor
+    seed_model = "portfolio_model_g791_v2_fold1.pt" if n_features >= 57 else "portfolio_model_g791_fold1.pt"
+    ckpt = torch.load(MODEL_DIR / seed_model, map_location=DEVICE, weights_only=False)
+    fm_n = np.array(ckpt["feat_mean"]).reshape(1,1,1,-1)
+    fs_n = np.array(ckpt["feat_std"]).reshape(1,1,1,-1)
+    X_n = (X_panel.astype(np.float32) - fm_n) / fs_n
+    X_t = torch.from_numpy(X_n).to(DEVICE, dtype=torch.float32)
+    m_t = torch.ones(1, 300, device=DEVICE)
 
-        model_e = PortfolioPredictor(n_features=n_features,
+    model_e = PortfolioPredictor(n_features=n_features,
             d_model=ckpt["config"].get("d_model",128),
             n_transformer_layers=ckpt["config"].get("n_transformer_layers",2),
             n_gru_layers=ckpt["config"].get("n_gru_layers",2),
             d_ff=ckpt["config"].get("d_ff",256),
             use_market_gate=ckpt["config"].get("use_market_gate", False))
-        model_e.load_state_dict(ckpt["model_state_dict"])
-        model_e.to(DEVICE); model_e.eval()
-        with torch.no_grad():
-            emb = model_e.encode_stocks(X_t, m_t).squeeze(0).cpu().numpy()
-        idxs = np.array([stock_idx_map[s] for s in candidate_ids])
-        e = emb[idxs]
-        e_n = e / (np.linalg.norm(e, axis=1, keepdims=True) + 1e-9)
-        sim = e_n @ e_n.T
+    model_e.load_state_dict(ckpt["model_state_dict"])
+    model_e.to(DEVICE); model_e.eval()
+    with torch.no_grad():
+        emb = model_e.encode_stocks(X_t, m_t).squeeze(0).cpu().numpy()
+    idxs = np.array([stock_idx_map[s] for s in candidate_ids])
+    e = emb[idxs]
+    e_n = e / (np.linalg.norm(e, axis=1, keepdims=True) + 1e-9)
+    sim = e_n @ e_n.T
 
     sc = np.array(candidate_scores)
 
@@ -645,39 +609,25 @@ def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Controller — LGBM + NN + 博弈")
+    parser = argparse.ArgumentParser(description="Controller — LGBM + NN + 纳什")
     parser.add_argument("--ensemble", type=str, default="lgbm-nn",
-        choices=["lgbm", "lgbm-nn", "gp", "fold1", "old-tscv", "old-3model", "compare"])
+        choices=["lgbm", "lgbm-nn", "gp", "compare"])
     parser.add_argument("--topk", type=int, default=5)
     parser.add_argument("--weight", type=str, default="bdc", choices=["equal", "softmax", "inv_vol", "bdc"])
     parser.add_argument("--output", type=str, default=str(SUBMISSION_PATH))
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--game", type=float, nargs="?", const=0.25, default=None,
-                        help="纳什均衡多样化(λ,默认0.25)。在精度门控后对动量候选股做多样化选股")
-    parser.add_argument("--nash-mode", type=str, default="embedding",
-                        choices=["embedding", "spectral"],
-                        help="纳什相似度: 'embedding'(NN,默认) 或 'spectral'(FFT频谱)")
+                        help="纳什均衡多样化λ")
     parser.add_argument("--multi-day", type=int, default=1, choices=[1,2,3,4,5],
-                        help="多日 Rolling 预测(默认1=仅最新日, 3=最近3日加权)")
-
-    parser.add_argument("--bdc", type=str, nargs="?", const="pure", default=None,
-                        choices=["pure", "hybrid"],
-                        help="BDC 管线: 'pure'=纯BDC, 'hybrid'=精度门控+BDC排序加权")
-    parser.add_argument("--risk-penalty", type=float, default=0.30,
-                        help="BDC管线: 风险惩罚权重 (默认0.30)")
+                        help="多日 Rolling 预测")
     parser.add_argument("--cash-buffer", type=float, default=None,
-                        help="自适应现金仓位阈值。信号弱时保留现金(默认关闭)。"
-                             "参考Game-BDC2026 T7: 值越大越保守")
+                        help="自适应现金仓位(默认关闭)")
     parser.add_argument("--center", action="store_true",
-                        help="零均值居中: 选股前对分数做零均值处理(消除系统性偏差)")
-    parser.add_argument("--double-ensemble", action="store_true",
-                        help="LGBM DoubleEnsemble: 特征子采样(70%) + M0误差加权训练6个模型")
+                        help="零均值居中")
     parser.add_argument("--no-overbought", action="store_true",
-                        help="超买过滤: RSI>75 或 10日涨幅>20% 的股票排除")
+                        help="超买过滤: RSI>75或10日涨幅超20pct排除")
     parser.add_argument("--diverse-industry", type=int, default=None,
-                        help="行业分散: 同行业最多N只(如2)")
-    parser.add_argument("--market-state", action="store_true",
-                        help="市场状态门控: 20日均线向下时切防御板块")
+                        help="行业分散: 同行业最多N只")
 
     args = parser.parse_args()
 
@@ -733,15 +683,6 @@ def main():
                 seed, fold = name.split("_f")
                 scores += w * load_predict(MODEL_DIR / f"portfolio_model_{seed}_v2_fold{fold}.pt", X_lt, 57)
         nn_scores = scores
-    elif args.ensemble == "fold1":
-        nn_scores = load_predict(MODEL_DIR / "portfolio_model_g791_fold1.pt", X_lt, 51)
-    elif args.ensemble == "old-tscv":
-        nn_scores = np.mean([load_predict(MODEL_DIR / f"portfolio_model_g791_fold{k}.pt", X_lt, 51) for k in range(1,5)], axis=0)
-    elif args.ensemble == "old-3model":
-        s_g = load_predict(MODEL_DIR / "portfolio_model_g791.pt", X_lt, 51)
-        s_s = load_predict(MODEL_DIR / "portfolio_model_seed42.pt", X_lt, 51)
-        s_h = load_predict(MODEL_DIR / "portfolio_model_g787.pt", X_lt, 51)
-        nn_scores = 0.6 * s_g + 0.15 * s_s + 0.25 * s_h
     elif args.ensemble == "lgbm-nn":
         n_days = max(1, min(args.multi_day, len(dates)))
         day_weights = {1: [1.0], 2: [0.6, 0.4], 3: [0.5, 0.3, 0.2],
@@ -842,7 +783,7 @@ def main():
     pool_sc = [scores[i] for i in pool]
 
     # ── BDC 管线 vs 旧管线 ──
-    if args.bdc:
+    if False:  # BDC 管线已移除
         if args.bdc == "hybrid":
             print("  Using HYBRID pipeline (legacy precision gate + BDC rerank + BDC weights)...")
             # 先做旧管线的精度门控
@@ -962,8 +903,8 @@ def main():
     except Exception as _e:
         print(f"  [log] warn: {_e}")
 
-    # ── BDC vs 旧管线对比 ──
-    if args.bdc:
+    # ── BDC vs 旧管线对比 ── (已移除)
+    if False:
         bdc_label = {"pure": "BDC纯管线", "hybrid": "BDC混合管线"}.get(args.bdc, "BDC管线")
         print(f"\n  --- 自动对比: {bdc_label} vs 旧管线 ---")
         import shutil, os
