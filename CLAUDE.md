@@ -199,7 +199,10 @@ python controller.py --ensemble compare
 |:-----|:----:|:-------|:------|
 | `--ensemble` | `lgbm-nn` | lgbm/lgbm-nn/gp/compare | 模型融合方式 |
 | `--weight` | `bdc` | equal/softmax/inv_vol/bdc | 权重分配 |
-| `--game` | — | float | 纳什均衡λ，0.2-0.3推荐 |
+| `--game` | auto | float | 纳什均衡λ (默认自动: 根据拥挤度确定) |
+| `--moe` | — | flag | 动态MoE: HMM市场状态自适应LGBM/NN权重 |
+| `--confidence` | — | flag | 置信度建模: 集成方差高时自动减仓 |
+| `--hrp` | — | flag | 层次风险平价: 基于NN embedding聚类分配权重 |
 | `--multi-day` | 1 | 1-5 | 多日rolling预测天数 |
 | `--no-overbought` | — | flag | 超买过滤(RSI>75或10d>20%) |
 | `--diverse-industry` | — | int N | 同行业最多N只 |
