@@ -204,10 +204,12 @@ def predict_lgbm(model, fm, fs, df, feature_cols, date):
 # NN 模型加载
 # =============================================================================
 
-def load_predict(path, X_np, n_features=57):
+def load_predict(path, X_np, n_features=None):
     from model import PortfolioPredictor
     ckpt = torch.load(path, map_location=DEVICE, weights_only=False)
     cfg = ckpt.get("config", {})
+    # 优先使用 checkpoint 中的特征数（兼容新旧模型）
+    n_features = cfg.get("n_features", n_features or 57)
     model = PortfolioPredictor(n_features=n_features,
         d_model=cfg.get("d_model", 128), n_transformer_layers=cfg.get("n_transformer_layers", 2),
         n_gru_layers=cfg.get("n_gru_layers", 2), d_ff=cfg.get("d_ff", 256),
