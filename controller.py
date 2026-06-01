@@ -460,7 +460,7 @@ def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
                              panel, args, n_features=57, stock_idx_map=None,
                              X_lt=None, nash_mode="embedding"):
     """原有的精度门控+波动率过滤+选股权重逻辑。"""
-    # 精度门控
+    # ── 精度门控 + 超买过滤 ──
     precision_ids, psc = [], []
     for idx, sid in enumerate(pool_ids):
         scv = pool_sc[idx]
@@ -470,6 +470,18 @@ def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
             dd = (sd['close'] / sd['close'].rolling(20).max() - 1.0).iloc[-20:].min()
         except:
             ret_5d, dd = 0, -0.01
+
+        # 超买过滤 (RSI>75 或 10日涨幅>20%)
+        if getattr(args, 'no_overbought', False):
+            try:
+                rsi_val = float(sd['rsi_14'].iloc[-1]) if 'rsi_14' in sd.columns else 50
+                ret_10d = sd['pctChg'].iloc[-10:].sum() / 100.0
+                if rsi_val > 75 or ret_10d > 0.20:
+                    print(f"    overbought skip {sid}: RSI={rsi_val:.0f} ret_10d={ret_10d:.1%}")
+                    continue
+            except:
+                pass
+
         if ret_5d > 0 and dd > -0.08:
             precision_ids.append(sid)
             psc.append(scv)
@@ -509,6 +521,67 @@ def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
         if v <= vol_med * 1.2:
             final_ids.append(sid)
             fsc.append(scv)
+
+    # ── 市场状态门控（20日均线方向） ──
+    if getattr(args, 'market_state', False):
+        try:
+            mid_date = str(panel.index.get_level_values('date').unique()[-20])
+            market_20d_ret = panel.xs(panel.index.get_level_values('stock_id').unique()[0], level='stock_id')['pctChg'].iloc[-20:].sum() / 100.0
+            market_5d_ret = panel.xs(panel.index.get_level_values('stock_id').unique()[0], level='stock_id')['pctChg'].iloc[-5:].mean() / 100.0
+            # 防御板块关键词
+            defensive_kw = ['煤炭', '石油', '公用', '银行', '电力', '交运', '钢铁', '建筑']
+            offensive_kw = ['半导体', 'AI', '通信', '软件', '计算机', '电子', '传媒', '军工']
+
+            if market_20d_ret < -0.03 and market_5d_ret < 0:
+                # 市场进入下行趋势: 仅保留防御板块
+                def_filtered_ids, def_filtered_sc = [], []
+                for sid, scv in zip(final_ids, fsc):
+                    try:
+                        ind = panel.xs(sid, level='stock_id')['industry'].iloc[-1] if 'industry' in panel.columns else ''
+                        if any(kw in str(ind) for kw in defensive_kw):
+                            def_filtered_ids.append(sid)
+                            def_filtered_sc.append(scv)
+                    except:
+                        pass
+                if len(def_filtered_ids) >= 2:
+                    old_n = len(final_ids)
+                    final_ids, fsc = def_filtered_ids, def_filtered_sc
+                    print(f"  Market DOWN: switched to defensive ({old_n}→{len(final_ids)} stocks)")
+                elif len(def_filtered_ids) >= 1:
+                    # 混合防御+原池
+                    orig = list(zip(final_ids, fsc))
+                    def_set = set(def_filtered_ids)
+                    kept = [(s, c) for s, c in orig if s in def_set]
+                    for s, c in orig:
+                        if len(kept) >= 5: break
+                        if s not in def_set:
+                            kept.append((s, c))
+                    final_ids = [s for s, c in kept]
+                    fsc = [c for s, c in kept]
+                    print(f"  Market DOWN: mixed defensive+original ({len(final_ids)} stocks)")
+        except Exception as e:
+            print(f"  [warn] market_state skipped: {e}")
+
+    # ── 行业分散（同行业最多 N 只） ──
+    if getattr(args, 'diverse_industry', None) is not None and 'industry' in panel.columns:
+        max_per_ind = args.diverse_industry
+        sel_ordered = sorted(zip(final_ids, fsc), key=lambda x: -x[1])
+        ind_count = {}
+        diverse_ids, diverse_sc = [], []
+        for sid, scv in sel_ordered:
+            try:
+                ind = str(panel.xs(sid, level='stock_id')['industry'].iloc[-1])
+            except:
+                ind = 'Unknown'
+            if ind_count.get(ind, 0) < max_per_ind:
+                ind_count[ind] = ind_count.get(ind, 0) + 1
+                diverse_ids.append(sid)
+                diverse_sc.append(scv)
+        if len(diverse_ids) >= max(2, min(args.topk, 5) // 2):
+            rej = len(final_ids) - len(diverse_ids)
+            if rej > 0:
+                print(f"  Industry diverse: {rej} replaced (max {max_per_ind}/industry)")
+            final_ids, fsc = diverse_ids, diverse_sc
 
     # 选 top K
     topk = min(args.topk, 5)
@@ -599,6 +672,12 @@ def main():
                         help="零均值居中: 选股前对分数做零均值处理(消除系统性偏差)")
     parser.add_argument("--double-ensemble", action="store_true",
                         help="LGBM DoubleEnsemble: 特征子采样(70%) + M0误差加权训练6个模型")
+    parser.add_argument("--no-overbought", action="store_true",
+                        help="超买过滤: RSI>75 或 10日涨幅>20% 的股票排除")
+    parser.add_argument("--diverse-industry", type=int, default=None,
+                        help="行业分散: 同行业最多N只(如2)")
+    parser.add_argument("--market-state", action="store_true",
+                        help="市场状态门控: 20日均线向下时切防御板块")
 
     args = parser.parse_args()
 
