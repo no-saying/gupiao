@@ -65,7 +65,7 @@ from config import (
 )
 from data_loader import get_official_stock_ids, build_panel_from_official
 from features import engineer_features, make_window_samples, get_norm_stats
-from model import PortfolioPredictor, lambdarank_loss, pairwise_ranking_loss, listnet_loss, topk_listnet_loss
+from model import PortfolioPredictor, lambdarank_loss, pairwise_ranking_loss, listnet_loss, topk_listnet_loss, pcc_loss
 
 
 # =============================================================================
@@ -422,6 +422,7 @@ def train_model(
         "pairwise": pairwise_ranking_loss,
         "listnet": listnet_loss,
         "topk_listnet": topk_listnet_loss,
+        "pcc": pcc_loss,
     }
     loss_fn = loss_map.get(loss_name, listnet_loss)
 
@@ -702,7 +703,7 @@ def main():
                         help="强制重新下载所有数据（清除缓存）")
     parser.add_argument("--epochs", type=int, default=N_EPOCHS,
                         help=f"训练轮数（默认: {N_EPOCHS}）")
-    parser.add_argument("--loss", choices=["lambdarank", "pairwise", "listnet", "topk_listnet"],
+    parser.add_argument("--loss", choices=["lambdarank", "pairwise", "listnet", "topk_listnet", "pcc"],
                         default="listnet",
                         help="损失函数: lambdarank/pairwise/listnet(推荐)/topk_listnet")
     parser.add_argument("--lr", type=float, default=LR,
@@ -846,7 +847,7 @@ def main():
             print(f"  [tscv] Fold {k+1}/{len(folds)}: train={len(tr_ld.dataset)} val={len(va_ld.dataset)}")
             print(f"  {'='*50}")
 
-            fold_model = PortfolioPredictor(n_features=n_features, use_attention=USE_ATTENTION)
+            fold_model = PortfolioPredictor(n_features=n_features, use_attention=USE_ATTENTION, use_market_gate=USE_MARKET_GATE)
             if args.load_pretrained:
                 pt_path = Path(args.load_pretrained)
                 if pt_path.exists():
@@ -871,7 +872,8 @@ def main():
                 "config": {"n_features": n_features, "d_model": D_MODEL,
                            "n_transformer_layers": 2, "n_heads": N_HEADS,
                            "n_gru_layers": N_GRU_LAYERS, "d_ff": D_FF,
-                           "use_attention": USE_ATTENTION},
+                           "use_attention": USE_ATTENTION,
+                           "use_market_gate": USE_MARKET_GATE},
             }, fold_path)
             print(f"  [tscv] Fold {k+1} saved to {fold_path}")
 
@@ -895,9 +897,11 @@ def main():
             n_transformer_layers=BIG_N_TRANSFORMER_LAYERS,
             d_ff=BIG_D_FF,
             use_attention=USE_ATTENTION,
+            use_market_gate=USE_MARKET_GATE,
         )
     else:
-        model = PortfolioPredictor(n_features=n_features, use_attention=USE_ATTENTION)
+        model = PortfolioPredictor(n_features=n_features, use_attention=USE_ATTENTION,
+                                   use_market_gate=USE_MARKET_GATE)
 
     # 加载预训练编码器权重（如果有）
     if args.load_pretrained:
@@ -986,6 +990,7 @@ def main():
             "n_gru_layers": actual_n_gru_layers,
             "d_ff": actual_d_ff,
             "use_attention": USE_ATTENTION,
+            "use_market_gate": USE_MARKET_GATE,
         },
     }, model_path)
     print(f"\n  Model saved to {model_path}")

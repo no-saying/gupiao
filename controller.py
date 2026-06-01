@@ -120,7 +120,8 @@ def load_predict(path, X_np, n_features=57):
     model = PortfolioPredictor(n_features=n_features,
         d_model=cfg.get("d_model", 128), n_transformer_layers=cfg.get("n_transformer_layers", 2),
         n_gru_layers=cfg.get("n_gru_layers", 2), d_ff=cfg.get("d_ff", 256),
-        use_attention=cfg.get("use_attention", False))
+        use_attention=cfg.get("use_attention", False),
+        use_market_gate=cfg.get("use_market_gate", False))
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(DEVICE); model.eval()
     fm = np.array(ckpt["feat_mean"]).reshape(1,1,1,-1)
@@ -198,7 +199,8 @@ def nash_equilibrium_selection(candidate_ids, candidate_scores, stock_idx_map, p
             d_model=ckpt["config"].get("d_model",128),
             n_transformer_layers=ckpt["config"].get("n_transformer_layers",2),
             n_gru_layers=ckpt["config"].get("n_gru_layers",2),
-            d_ff=ckpt["config"].get("d_ff",256))
+            d_ff=ckpt["config"].get("d_ff",256),
+            use_market_gate=ckpt["config"].get("use_market_gate", False))
         model_e.load_state_dict(ckpt["model_state_dict"])
         model_e.to(DEVICE); model_e.eval()
         with torch.no_grad():
@@ -497,6 +499,9 @@ def main():
                         help="BDC 管线: 'pure'=纯BDC, 'hybrid'=精度门控+BDC排序加权")
     parser.add_argument("--risk-penalty", type=float, default=0.30,
                         help="BDC管线: 风险惩罚权重 (默认0.30)")
+    parser.add_argument("--cash-buffer", type=float, default=None,
+                        help="自适应现金仓位阈值。信号弱时保留现金(默认关闭)。"
+                             "参考Game-BDC2026 T7: 值越大越保守")
 
     args = parser.parse_args()
 
@@ -691,6 +696,31 @@ def main():
         sel_ids, weights = legacy_select_and_weight(
             pool_ids, pool_sc, pool, valid, scores, stock_ids, panel, args,
             stock_idx_map=stock_idx_map, X_lt=X_lt, nash_mode=args.nash_mode)
+
+    # ── 自适应现金仓位 ──（选股后、输出前）
+    if args.cash_buffer is not None and args.cash_buffer > 0 and len(weights) > 0:
+        try:
+            top_scores = scores[valid]
+            n_compare = min(10, len(top_scores))
+            if len(top_scores) >= n_compare:
+                signal_strength = float(top_scores[-1] - top_scores[-n_compare])
+            elif len(top_scores) >= 5:
+                signal_strength = float(top_scores[-1] - top_scores[-5])
+            else:
+                signal_strength = float(top_scores[-1] - top_scores[len(top_scores)//2])
+
+            buffer_threshold = args.cash_buffer * float(np.std(top_scores)) if len(top_scores) > 1 else 0.05
+            cash_pct = 0.0
+            if signal_strength < buffer_threshold:
+                cash_pct = 0.15
+            if signal_strength < buffer_threshold * 0.5:
+                cash_pct = 0.30
+
+            if cash_pct > 0:
+                weights = [w * (1.0 - cash_pct) for w in weights]
+                print(f"  Cash buffer: {cash_pct*100:.0f}% (strength={signal_strength:.6f})")
+        except Exception as e:
+            print(f"  [warn] cash_buffer skipped: {e}")
 
     # ── 输出 ──
     print(f"\nSelected {len(sel_ids)} stocks:")

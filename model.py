@@ -250,7 +250,53 @@ class CrossSectionalTransformer(nn.Module):
 
 
 # =============================================================================
-# 完整模型：时序编码 → 截面注意力 → 评分
+# 市场门控：用全市场平均表征调制个股
+# =============================================================================
+
+class MarketGate(nn.Module):
+    """
+    市场状态门控（Market Gating）。
+
+    核心思想（借鉴 AAAI 2024 MASTER）：
+      个股走势受整体市场环境影响（牛市应该更激进、熊市应该更保守）。
+      MarketGate 从所有股票的 embedding 中提炼"市场状态"，
+      用它对个股 embedding 做门控调制。
+
+    计算流程：
+      1. 对 N 只股票的 embedding 取（带权）均值 → 市场状态向量 (d_model,)
+      2. Linear(d_model→d_model) + Sigmoid → 门控信号
+      3. 逐元素乘回每只股票的 embedding
+
+    好处：不需要额外的市场数据，市场状态从个股表征中自动提炼。
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, emb: torch.Tensor,
+                mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Args:
+            emb:  (B, N, d_model)  — 个股 embedding
+            mask: (B, N)           — 1=有效, 0=屏蔽
+
+        Returns:
+            (B, N, d_model)  — 门控后的个股 embedding
+        """
+        if mask is not None:
+            # 带权均值：只取有效股票
+            market_state = (emb * mask.unsqueeze(-1)).sum(dim=1) \
+                         / mask.sum(dim=1, keepdim=True).clamp(min=1)
+        else:
+            market_state = emb.mean(dim=1)                   # (B, d_model)
+
+        gate = torch.sigmoid(self.gate_proj(market_state))   # (B, d_model)
+        return emb * gate.unsqueeze(1)                       # broadcast
+
+
+# =============================================================================
+# 完整模型：时序编码 → [市场门控] → 截面注意力 → 评分
 # =============================================================================
 
 class PortfolioPredictor(nn.Module):
@@ -282,11 +328,17 @@ class PortfolioPredictor(nn.Module):
                  d_model: int = D_MODEL, n_heads: int = N_HEADS,
                  n_gru_layers: int = N_GRU_LAYERS, d_ff: int = D_FF,
                  dropout: float = DROPOUT,
-                 use_attention: bool = False):
+                 use_attention: bool = False,
+                 use_market_gate: bool = False):
         super().__init__()
         self.d_model = d_model
+        self.use_market_gate = use_market_gate
 
         self.time_encoder = TimeEncoder(n_features, d_model, n_gru_layers, dropout, use_attention)
+
+        # 市场门控（可选）：时序编码后、截面注意力前
+        if use_market_gate:
+            self.market_gate = MarketGate(d_model)
 
         # 堆叠多层 Transformer
         self.transformers = nn.ModuleList([
@@ -326,6 +378,10 @@ class PortfolioPredictor(nn.Module):
         emb = self.time_encoder(x_flat)                # (B*N, d_model)
         emb = emb.reshape(B, N, -1)                    # (B, N, d_model)
 
+        # 市场门控（可选）
+        if self.use_market_gate and hasattr(self, 'market_gate'):
+            emb = self.market_gate(emb, mask)
+
         # 通过所有 Transformer 层
         for transformer in self.transformers:
             emb, _ = transformer(emb, mask)
@@ -352,7 +408,12 @@ class PortfolioPredictor(nn.Module):
         emb = self.time_encoder(x_flat)               # (B*N, d_model)
         emb = emb.reshape(B, N, -1)                   # (B, N, d_model)
 
-        # ── 阶段 2: 截面自注意力 ─────────────────────────────
+        # ── 阶段 2: 市场门控（可选） ──────────────────────────
+        # 用全市场平均表征调制个股 embedding，让模型感知市场环境
+        if self.use_market_gate and hasattr(self, 'market_gate'):
+            emb = self.market_gate(emb, mask)
+
+        # ── 阶段 3: 截面自注意力 ─────────────────────────────
         # 此时 emb 的每一行 (N, d_model) 代表同一样本内 N 只股票的向量
         # Transformer 在这 N 只股票之间做自注意力
         attn_weights = None
@@ -735,3 +796,58 @@ def topk_listnet_loss(
         w_t = torch.tensor(kept_w, device=device)
         return (losses_t * w_t).sum() / w_t.sum()
     return losses_t.mean()
+
+
+# ── 损失 6: PCC Loss（Pearson Correlation Coefficient） ─────────
+
+def pcc_loss(
+    scores: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    PCC Loss: 负 Pearson 相关系数，直接优化截面 RankIC。
+
+    核心思想：
+      - 我们关心的是股票间的排序（谁最该买），而非精确预测收益率
+      - Pearson 相关系数衡量预测值与实际收益的线性相关性
+      - 最大化 Pearson r = 最小化 -Pearson r
+
+    为什么这比 MSE 更适合选股问题？
+      MSE:     (pred_i - label_i)² → 惩罚绝对误差
+      PCC:     -Σ(pred-μp)(label-μl) / (σp·σl) → 只关心相对排序
+      选股只需要知道"A 比 B 好"，不需要知道"A 比 B 好多少"
+
+    参考: MASTER (AAAI 2024) 使用 PCC Loss 取得了 0.267 的 20 日 RankIC
+    """
+    if valid_mask is None:
+        valid_mask = torch.ones_like(targets)
+
+    B, N = scores.shape
+    device = scores.device
+    losses = []
+
+    for i in range(B):
+        valid_idx = (valid_mask[i] > 0.5).nonzero(as_tuple=True)[0]
+        n_valid = len(valid_idx)
+        if n_valid < 2:
+            continue
+
+        s = scores[i, valid_idx]
+        t = targets[i, valid_idx]
+
+        s_center = s - s.mean()
+        t_center = t - t.mean()
+
+        cov = (s_center * t_center).sum()
+        s_std = s_center.norm() + eps
+        t_std = t_center.norm() + eps
+
+        pcc = cov / (s_std * t_std)
+        losses.append(-pcc)  # 负号：最小化负相关系数 = 最大化相关系数
+
+    if not losses:
+        return torch.tensor(0.0, device=device)
+
+    return torch.stack(losses).mean()
