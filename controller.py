@@ -99,9 +99,9 @@ def train_lgbm_ranker(df, feature_cols, model_path=None,
     print(f"  [DE] M0: {len(feature_cols)} features, uniform weights")
     model = lgb.LGBMRanker(
         objective='lambdarank', boosting_type='gbdt',
-        n_estimators=500, num_leaves=63, learning_rate=0.05,
-        min_child_samples=20, reg_lambda=0.1, reg_alpha=0.1,
-        subsample=0.8, colsample_bytree=0.8,
+        n_estimators=350, num_leaves=68, learning_rate=0.0196,
+        min_child_samples=42, reg_lambda=0.0022, reg_alpha=0.0054,
+        subsample=0.738, colsample_bytree=0.939,
         label_gain=[i for i in range(10)], verbose=-1, random_state=42)
     model.fit(X_tr, y_tr, group=grp, eval_metric=['ndcg'], callbacks=[lgb.log_evaluation(0)])
 
@@ -136,9 +136,9 @@ def train_lgbm_ranker(df, feature_cols, model_path=None,
             print(f"  [DE] M{i}: {len(sub_feats)} features, error-weighted")
             sub_model = lgb.LGBMRanker(
                 objective='lambdarank', boosting_type='gbdt',
-                n_estimators=500, num_leaves=63, learning_rate=0.05,
-                min_child_samples=20, reg_lambda=0.1, reg_alpha=0.1,
-                subsample=0.8, colsample_bytree=0.8,
+                n_estimators=350, num_leaves=68, learning_rate=0.0196,
+                min_child_samples=42, reg_lambda=0.0022, reg_alpha=0.0054,
+                subsample=0.738, colsample_bytree=0.939,
                 label_gain=[i for i in range(10)], verbose=-1, random_state=42 + i)
             sub_model.fit(X_sub, y_tr, group=grp_sub,
                           sample_weight=sample_w,
@@ -181,19 +181,18 @@ def predict_lgbm(model, fm, fs, df, feature_cols, date):
     # 如果是 DoubleEnsemble 模型列表
     if isinstance(model, list):
         n_models = len(model)
-        groups = [len(day)]  # 单日，group_size = 全部股票
-        rank_sum = np.zeros(len(day), dtype=np.float64)
+        score_sum = np.zeros(len(day), dtype=np.float64)
         for i, item in enumerate(model):
             if i == 0:
                 # M0: 全特征
                 X = (day[feature_cols].values - fm.values) / fs.values
-                rank_sum += _pct_rank_per_group(item.predict(X), groups)
+                score_sum += item.predict(X)
             else:
                 sub_model, feat_idx = item
                 sub_feats = [feature_cols[j] for j in sorted(feat_idx)]
                 X_sub = (day[sub_feats].values - fm[sub_feats].values) / fs[sub_feats].values
-                rank_sum += _pct_rank_per_group(sub_model.predict(X_sub), groups)
-        day['lgb_score'] = (rank_sum / n_models).astype(np.float32)
+                score_sum += sub_model.predict(X_sub)
+        day['lgb_score'] = (score_sum / n_models).astype(np.float32)
     else:
         X = (day[feature_cols].values - fm.values) / fs.values
         day['lgb_score'] = model.predict(X)
@@ -800,6 +799,10 @@ def main():
                         help="置信度建模: 模型集成方差高时自动减仓")
     parser.add_argument("--hrp", action="store_true",
                         help="层次风险平价: 基于NN embedding聚类分配权重")
+    parser.add_argument("--de", action="store_true",
+                        help="DoubleEnsemble LGBM: 特征子采样+误差加权多模型融合")
+    parser.add_argument("--de-n-models", type=int, default=6,
+                        help="DoubleEnsemble 子模型数（含M0，默认6）")
 
     args = parser.parse_args()
 
@@ -825,8 +828,10 @@ def main():
         latest_date = sorted(lgbm_df['date'].unique())[-1]
         model_path = MODEL_DIR / "lgbm_ranker.txt"
         if args.no_cache and model_path.exists(): model_path.unlink()
-        lgbm_result = train_lgbm_ranker(lgbm_df, feat_cols, model_path)
-        if False:  # double_ensemble disabled
+        lgbm_result = train_lgbm_ranker(lgbm_df, feat_cols, model_path,
+                                          double_ensemble=args.de,
+                                          de_n_models=args.de_n_models)
+        if args.de:
             lgbm_model, lgbm_fm, lgbm_fs, lgbm_rankic, _ = lgbm_result
         else:
             lgbm_model, lgbm_fm, lgbm_fs, lgbm_rankic = lgbm_result

@@ -360,9 +360,9 @@ def main():
             import lightgbm as lgb
             lgbm_model = lgb.LGBMRanker(
                 objective='lambdarank', boosting_type='gbdt',
-                n_estimators=500, num_leaves=63, learning_rate=0.05,
-                min_child_samples=20, reg_lambda=0.1, reg_alpha=0.1,
-                subsample=0.8, colsample_bytree=0.8,
+                n_estimators=350, num_leaves=68, learning_rate=0.0196,
+                min_child_samples=42, reg_lambda=0.0022, reg_alpha=0.0054,
+                subsample=0.738, colsample_bytree=0.939,
                 label_gain=[i for i in range(10)], verbose=-1, random_state=42)
             lgbm_model.fit(X_tr, y_tr, group=grp,
                            eval_metric=['ndcg'], callbacks=[lgb.log_evaluation(0)])
