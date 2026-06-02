@@ -925,7 +925,7 @@ def main():
         lgbm_arr = np.array([lgbm_scores.get(s, 0) for s in stock_ids])
         def norm2(s): return (s - s.min()) / (s.max() - s.min() + 1e-9)
         blend = 0.8 * norm2(lgbm_arr) + 0.2 * norm2(gp_scores)
-        eval_top5({s: blend[i] for i, s in enumerate(stock_ids)}, "LGBM(0.7)+NN(0.3)")
+        eval_top5({s: blend[i] for i, s in enumerate(stock_ids)}, "LGBM(0.8)+NN(0.2)")
         # old models
         drop = [c for c in NEW_FEATS if c in panel.columns]
         p_old = panel.drop(columns=drop) if drop else panel
