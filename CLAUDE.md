@@ -231,39 +231,55 @@ python train.py --seed 787 --loss lambdarank    --tscv --batch-size 32
 
 ### 6.1 14周滚动回测 (2025-06 ~ 2026-05)
 
-测试方法: 每周滚动训练LGBM + NN 12模型推理 → 选股 → 评分。完整模拟比赛流程。
+测试方法: 每周滚动训练LGBM（Optuna调参）+ NN (Sharpe Loss) 12模型推理 → 选股 → 评分。
+LGBM超参数: `lr=0.0196, leaves=68, trees=350, reg=0.002`（Optuna 50轮搜索优化）。
 
-**73特征 + 过滤器 (`--no-overbought --diverse-industry 2`)**
+**80特征 + Optuna调参LGBM + Sharpe Loss NN**
 
-| 排名 | 策略 | 权重 | Mean | Std | Sharpe | WinRate | 最差周 | 最佳周 |
-|:---:|:-----|:----:|:----:|:---:|:------:|:-------:|:------:|:------:|
-| 🥇 | **Nash** | **inv_vol** | **0.075** | **0.038** | **1.98** | **100%** | +0.021 | +0.130 |
-| 🥇 | Nash | equal | 0.077 | 0.039 | 1.98 | 100% | +0.018 | +0.130 |
-| 🥉 | Nash | bdc | 0.079 | 0.041 | 1.94 | 100% | +0.017 | +0.132 |
-| 4 | Nash | softmax | 0.106 | 0.062 | 1.71 | 100% | +0.010 | +0.218 |
-| 5 | **BlendNash** | **inv_vol** | **0.081** | **0.054** | **1.52** | **93%** | -0.033 | +0.193 |
-| 6 | BlendNash | equal | 0.081 | 0.055 | 1.46 | 93% | -0.046 | +0.197 |
-| 7 | BlendNash | softmax | 0.082 | 0.057 | 1.44 | 93% | -0.049 | +0.194 |
-| 8 | BlendNash | bdc | 0.077 | 0.055 | 1.40 | 93% | -0.047 | +0.196 |
+| 排名 | 策略 | 权重 | Mean | Std | Min | Max | Median | Sharpe | WinRate |
+|:---:|:-----|:----:|:----:|:---:|:---:|:---:|:------:|:------:|:-------:|
+| 🥇 | **BlendNash** | **inv_vol** | **0.0903** | 0.0660 | -0.017 | **0.236** | 0.0927 | **1.37** | 92.9% |
+| 🥇 | **LGBM_Nash** | **softmax** | **0.0865** | 0.0566 | +0.001 | 0.204 | 0.0985 | **1.53** | **100%** |
+| 🥉 | BlendNash | equal | 0.0863 | 0.0626 | -0.036 | 0.206 | 0.0899 | 1.38 | 92.9% |
+| 4 | BlendNash | softmax | 0.0863 | 0.0624 | -0.043 | 0.198 | 0.0921 | 1.38 | 92.9% |
+| 5 | LGBM_Nash | inv_vol | 0.0796 | 0.0599 | -0.005 | **0.236** | 0.0928 | 1.33 | 92.9% |
+| 6 | LGBM_Nash | bdc | 0.0790 | 0.0566 | -0.021 | 0.206 | 0.0944 | 1.40 | 92.9% |
+| 7 | LGBM_Nash | equal | 0.0779 | 0.0558 | -0.025 | 0.206 | 0.0937 | 1.40 | 92.9% |
+| 8 | FusionNash | inv_vol | 0.0797 | 0.0655 | -0.017 | **0.236** | 0.0738 | 1.22 | 92.9% |
 
-### 6.2 特征升级效果
+> LGBM超参调优后训练速度提升25%（350树 vs 500树），Sharpe从1.46提升至1.53。
 
-| 版本 | 特征 | BlendNash Sharpe | 最差周 | 关键改进 |
-|:----|:----:|:----------------:|:------:|:---------|
-| 初始 57 | 量价+技术 | 1.44 | -0.052 | 基线 |
-| +日历+截面 70 | wday/CS/excess | **1.56** | **-0.001** | 日历效应+截面信号 |
-| +调整日+背离 73 | rebalance/divergence | 1.52 | -0.049 | 成分股调整+量价背离 |
+### 6.2 特征升级与LGBM调参效果
 
-### 6.3 BlendNash softmax 14周明细
+| 版本 | 特征 | LGBM_Nash Sharpe | 关键改进 |
+|:----|:----:|:----------------:|:---------|
+| 初始 57 | 量价+技术 | 1.44 | 基线 |
+| +日历+截面 70 | wday/CS/excess | **1.56** | 日历效应+截面信号 |
+| +调整日+背离 73 | rebalance/divergence | 1.52 | 成分股调整+量价背离 |
+| **+LGBM调参** | Optuna优化 | **1.53** | 超参数搜索（lr/leaves/trees/reg） |
+
+### 6.3 LGBM超参搜索（Optuna 50轮）
 
 ```
-W1  +0.128  W2  +0.074  W3  +0.203  W4  -0.001
-W5  +0.135  W6  +0.077  W7  -0.001  W8  +0.100
-W9  +0.123  W10 +0.192  W11 +0.060  W12 +0.033
-W13 +0.063  W14 +0.121
+最佳RankIC: 0.4415
+最佳参数:
+  n_estimators: 350, num_leaves: 68, learning_rate: 0.0196
+  subsample: 0.738, colsample_bytree: 0.939
+  reg_lambda: 0.0022, reg_alpha: 0.0054, min_child_samples: 42
 ```
 
-14周仅2周微亏(-0.001), 胜率86%。最大回撤 -0.1%。
+默认参数（`lr=0.05, leaves=63, trees=500, reg=0.1`）的RankIC约0.43，优化后提升至0.4415。
+
+### 6.4 BlendNash inv_vol 14周明细（总排名第一）
+
+```
+W1  +0.149  W2  +0.206  W3  +0.119  W4  +0.013
+W5  +0.098  W6  +0.175  W7  +0.068  W8  +0.074
+W9  +0.126  W10 +0.068  W11 +0.064  W12 +0.145
+W13 -0.017  W14 +0.185
+```
+
+14周仅1周微亏(-0.017), 胜率92.9%。最大周收益+0.206。
 
 ---
 
@@ -361,28 +377,29 @@ max  U(S) = mean(score_i) - λ × mean(sim_ij)
 
 | 文件 | 行数 | 职责 |
 |:-----|:----:|:------|
-| `controller.py` | ~940 | 主入口: 数据加载→特征→LGBM→NN→融合→纳什→选股→输出 |
+| `controller.py` | ~960 | 主入口: 数据加载→特征→LGBM→NN→融合→纳什→选股→输出 |
 | `train.py` | ~1000 | NN训练: TSCV/decay/augment/loss选择/模型保存 |
-| `model.py` | ~740 | GRU+Transformer+MarketGate+ScoreHead+所有loss函数 |
-| `features.py` | ~600 | 73维特征工程+窗口采样+标准化 |
-| `data_loader.py` | ~350 | 数据下载+panel构建+缓存 |
+| `model.py` | ~750 | GRU+Transformer+MarketGate+ScoreHead+所有loss函数 |
+| `features.py` | ~600 | 80维特征工程+窗口采样+标准化 |
+| `data_loader.py` | ~430 | 数据下载+panel构建+缓存+双向baostock补全 |
 | `score_self.py` | ~95 | 评分脚本(与比赛方一致) |
 | `config.py` | ~230 | 所有超参数 |
-| `window_test/backtest.py` | ~480 | 14周滚动回测 |
+| `window_test/backtest.py` | ~500 | 14周滚动回测 |
+| `optimize_lgbm.py` | ~90 | Optuna LGBM超参数搜索 |
 | `test_window.py` | ~170 | 数据泄漏检测 |
 
 ### 模型文件
 
 ```
 models/
-├── portfolio_model_g791_v2_fold[1-4].pt     73特征 seed 791
-├── portfolio_model_seed42_v2_fold[1-4].pt    73特征 seed 42
-├── portfolio_model_g787_v2_fold[1-4].pt      73特征 seed 787
-├── lgbm_ranker.txt                           LightGBM缓存
+├── portfolio_model_g791_v2_fold[1-4].pt     80特征 topk_listnet (当前)
+├── portfolio_model_seed42_v2_fold[1-4].pt    80特征 topk_listnet (当前)
+├── portfolio_model_g787_v2_fold[1-4].pt      80特征 lambdarank (当前)
+├── lgbm_ranker.txt                           LightGBM缓存 (Optuna调参)
 └── backup_v1_57feat/                         旧版57特征模型(备查)
 ```
 
-最后备份: /root/gupiao_final_20260601_221132
+最后备份: /root/gupiao_final_20260602_233555
 
 ---
 
