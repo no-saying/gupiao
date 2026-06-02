@@ -182,14 +182,17 @@ blend = 0.7 * norm(lgbm_score) + 0.3 * norm(nn_score)
 ### 5.1 核心命令
 
 ```bash
-# ── 极限分数模式（追求绝对收益, 0.143）──
+# ── 默认（0.8 LGBM + 0.2 NN, 14周100%胜率）──
+python controller.py
+
+# ── LGBM_Nash 纯LGBM高收益（Score 0.1718, Sharpe 1.53）──
+python controller.py --weight softmax
+
+# ── Blend Nash 稳健（Sharpe 1.42, 92.9%胜率）──
+python controller.py --weight inv_vol
+
+# ── 极限分数模式（不设过滤, 追求极值）──
 python controller.py --max-score --game 0.25 --weight softmax
-
-# ── 稳健模式（Sharpe 1.98, 14周100%胜率）──
-python controller.py --ensemble lgbm --game 0.25 --no-overbought --diverse-industry 2 --weight inv_vol
-
-# ── 均衡模式（Sharpe 1.52）──
-python controller.py --no-overbought --diverse-industry 2 --game 0.25 --weight inv_vol
 
 # ── 对比所有策略 ──
 python controller.py --ensemble compare
@@ -233,21 +236,23 @@ python train.py --seed 787 --loss lambdarank    --tscv --batch-size 32
 
 测试方法: 每周滚动训练LGBM（Optuna调参）+ NN (Sharpe Loss) 12模型推理 → 选股 → 评分。
 LGBM超参数: `lr=0.0196, leaves=68, trees=350, reg=0.002`（Optuna 50轮搜索优化）。
+默认融合: `0.8 * LGBM + 0.2 * NN`（经比例搜索验证）。
 
 **80特征 + Optuna调参LGBM + Sharpe Loss NN**
 
-| 排名 | 策略 | 权重 | Mean | Std | Min | Max | Median | Sharpe | WinRate |
-|:---:|:-----|:----:|:----:|:---:|:---:|:---:|:------:|:------:|:-------:|
-| **1** | **BlendNash** | **inv_vol** | **0.0903** | 0.0660 | -0.017 | **0.236** | 0.0927 | **1.37** | 92.9% |
-| **1** | **LGBM_Nash** | **softmax** | **0.0865** | 0.0566 | +0.001 | 0.204 | 0.0985 | **1.53** | **100%** |
-| 3 | BlendNash | equal | 0.0863 | 0.0626 | -0.036 | 0.206 | 0.0899 | 1.38 | 92.9% |
-| 4 | BlendNash | softmax | 0.0863 | 0.0624 | -0.043 | 0.198 | 0.0921 | 1.38 | 92.9% |
-| 5 | LGBM_Nash | inv_vol | 0.0796 | 0.0599 | -0.005 | **0.236** | 0.0928 | 1.33 | 92.9% |
-| 6 | LGBM_Nash | bdc | 0.0790 | 0.0566 | -0.021 | 0.206 | 0.0944 | 1.40 | 92.9% |
-| 7 | LGBM_Nash | equal | 0.0779 | 0.0558 | -0.025 | 0.206 | 0.0937 | 1.40 | 92.9% |
-| 8 | FusionNash | inv_vol | 0.0797 | 0.0655 | -0.017 | **0.236** | 0.0738 | 1.22 | 92.9% |
+| 排名 | 策略 | 权重 | Mean | Median | Std | Min | Max | Sharpe | WinRate |
+|:---:|:-----|:----:|:----:|:------:|:---:|:---:|:---:|:------:|:-------:|
+| 1 | **LGBM_Nash** | **softmax** | **0.0865** | **0.0985** | 0.0566 | +0.0015 | 0.2041 | **1.53** | **100%** |
+| 2 | **BlendNash** | **inv_vol** | **0.0828** | **0.0929** | 0.0609 | -0.0053 | **0.2357** | **1.36** | 92.9% |
+| 3 | BlendNash | softmax | 0.0810 | 0.0890 | 0.0572 | -0.0298 | 0.1955 | 1.42 | 92.9% |
+| 4 | BlendNash | equal | 0.0809 | 0.0881 | 0.0586 | -0.0343 | 0.1955 | 1.38 | 92.9% |
+| 5 | LGBM_Nash | bdc | 0.0790 | 0.0944 | 0.0566 | -0.0213 | 0.2058 | 1.40 | 92.9% |
+| 6 | LGBM_Nash | inv_vol | 0.0796 | 0.0928 | 0.0599 | -0.0053 | **0.2357** | 1.33 | 92.9% |
+| 7 | LGBM_Nash | equal | 0.0779 | 0.0937 | 0.0558 | -0.0246 | 0.2058 | 1.40 | 92.9% |
+| 8 | FusionNash | inv_vol | 0.0797 | 0.0738 | 0.0655 | -0.0169 | **0.2357** | 1.22 | 92.9% |
 
-> LGBM超参调优后训练速度提升25%（350树 vs 500树），Sharpe从1.46提升至1.53。
+> LGBM_Nash softmax 是唯一100%胜率策略，14周每周正收益。Min=+0.0015。
+> Blend 比例搜索验证0.8/0.2为最优平衡点（0.7/0.3 Mean略高但Std更大）。
 
 ### 6.2 特征升级与LGBM调参效果
 
@@ -270,16 +275,25 @@ LGBM超参数: `lr=0.0196, leaves=68, trees=350, reg=0.002`（Optuna 50轮搜索
 
 默认参数（`lr=0.05, leaves=63, trees=500, reg=0.1`）的RankIC约0.43，优化后提升至0.4415。
 
-### 6.4 BlendNash inv_vol 14周明细（总排名第一）
+### 6.4 14周Score明细
 
+**LGBM_Nash softmax（唯一100%胜率）**
 ```
-W1  +0.149  W2  +0.206  W3  +0.119  W4  +0.013
-W5  +0.098  W6  +0.175  W7  +0.068  W8  +0.074
-W9  +0.126  W10 +0.068  W11 +0.064  W12 +0.145
-W13 -0.017  W14 +0.185
+W 1 +0.2041  W 2 +0.1223  W 3 +0.0631  W 4 +0.0015
+W 5 +0.1420  W 6 +0.0380  W 7 +0.0145  W 8 +0.1011
+W 9 +0.1072  W10 +0.1202  W11 +0.0297  W12 +0.0304
+W13 +0.0959  W14 +0.1416
 ```
 
-14周仅1周微亏(-0.017), 胜率92.9%。最大周收益+0.206。
+**BlendNash inv_vol（Sharpe=1.36, Mean=0.0828）**
+```
+W 1 +0.1169  W 2 +0.0952  W 3 +0.1574  W 4 -0.0169
+W 5 +0.1349  W 6 +0.0257  W 7 +0.0030  W 8 +0.0902
+W 9 +0.1292  W10 +0.2357  W11 +0.0575  W12 +0.0209
+W13 +0.0811  W14 +0.1333
+```
+
+LGBM_Nash 14周全正，Min=+0.0015。BlendNash仅1周微亏(-0.0169)。
 
 ---
 
