@@ -11,7 +11,7 @@
 原始 OHLCV 数据
      │
      ▼
-特征工程 (73维) ───────────────────────────────┐
+特征工程 (80维) ───────────────────────────────┐
      │                                          │
      ▼                                          ▼
 LightGBM Ranker (截面排序) ──┐              NN Ensemble (12个子模型)
@@ -104,7 +104,8 @@ blend = 0.7 * norm(lgbm_score) + 0.3 * norm(nn_score)
 | v3 | 57+4+12+6 | 行业特征(ind_ret/alpha/ind_vol/industry_size) | 含行业信息 |
 | v4 (+日历+截面) | **70** | wday_0~3/month_sin_cos/is_month_end/is_cny_before_after/excess_return_1d/cs_rank_close_volume/industry_rank_return | **Sharpe 1.56** |
 | v5 (+调整日+量价背离) | **73** | is_rebalance_soon/divergence_bull/divergence_bear | Sharpe 1.52 |
-| **v6 (+微观结构)** | **78** | **amihud_illiq/ret_skew_20d/ret_kurt_20d/hl_spread/hl_spread_20d** | 待回测 |
+| **v6 (+微观结构)** | **78** | **amihud_illiq/ret_skew_20d/ret_kurt_20d/hl_spread/hl_spread_20d** | Sharpe 1.72 |
+| **v7 (+小波分解)** | **80** | **wavelet_trend/wavelet_noise** | Sharpe 1.72 (持平) |
 
 ### 3.2 特徵分类
 
@@ -126,6 +127,7 @@ blend = 0.7 * norm(lgbm_score) + 0.3 * norm(nn_score)
 | 日历 | 9 | wday_0~3, month_sin/cos, is_month_end, is_cny_before/after, **is_rebalance_soon** |
 | 量价背离 | 2 | **divergence_bull, divergence_bear** |
 | 微观结构 | 5 | **amihud_illiq, ret_skew_20d, ret_kurt_20d, hl_spread, hl_spread_20d** |
+| 小波分解 | 2 | **wavelet_trend, wavelet_noise** |
 
 ---
 
