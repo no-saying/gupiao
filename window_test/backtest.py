@@ -297,6 +297,10 @@ def main():
         ("LGBM_NN_BlendNash", "lgbm-nn", True),
         ("Nash_Blend_Fusion","fusion", True),
     ]
+    # Blend 比例搜索
+    BLEND_RATIOS = [0.5, 0.6, 0.7, 0.8, 0.9]
+    for r in BLEND_RATIOS:
+        strategies.append((f"Blend{int(r*10):d}_Nash", f"blend_{r:.1f}", True))
     weight_types = ["equal", "softmax", "inv_vol", "bdc"]
     t0 = time.time()
 
@@ -398,7 +402,7 @@ def main():
         if np.abs(lgbm_arr).max() < 1e-9:
             blend_dict = gp_dict
         else:
-            blend_arr = 0.7 * norm(lgbm_arr) + 0.3 * norm(gp_scores)
+            blend_arr = 0.8 * norm(lgbm_arr) + 0.2 * norm(gp_scores)
             blend_dict = {s: float(blend_arr[i]) for i, s in enumerate(stock_ids)}
 
         # ── e) Fusion: LGBM_Nash(0.6) + BlendNash(0.4) 分数融合 ──
@@ -410,7 +414,12 @@ def main():
             fs_arr[i] = 0.6 * ls + 0.4 * bs
         fusion_scores = {s: float(fs_arr[i]) for i, s in enumerate(stock_ids)}
 
+        # ── Blend 比例搜索 ──
         sources = {"lgbm": lgbm_scores, "gp": gp_dict, "lgbm-nn": blend_dict, "fusion": fusion_scores}
+        if np.abs(lgbm_arr).max() > 1e-9:
+            for r in BLEND_RATIOS:
+                b_arr = r * norm(lgbm_arr) + (1-r) * norm(gp_scores)
+                sources[f"blend_{r:.1f}"] = {s: float(b_arr[i]) for i, s in enumerate(stock_ids)}
 
         # ── d) 执行选股 → 评分 ──
         for sname, ensemble, use_nash in strategies:

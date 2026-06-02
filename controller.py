@@ -889,7 +889,7 @@ def main():
                 regime = compute_market_regime(panel)
                 blend = dynamic_moe_blend(lgbm_day_arr, gp_day, regime)
             else:
-                blend = 0.7 * norm(lgbm_day_arr) + 0.3 * norm(gp_day)
+                blend = 0.8 * norm(lgbm_day_arr) + 0.2 * norm(gp_day)
             ensemble += dw[i] * blend
             if n_days > 1:
                 print(f"    Day {i+1}({date_str}): w={dw[i]:.2f}")
@@ -897,7 +897,7 @@ def main():
         if n_days > 1:
             print(f"  {n_days}-day rolling ensemble (weights={dict(enumerate(dw))})")
         elif not args.moe:
-            print("  LightGBM(0.7) + NN GP(0.3) blend")
+            print("  LightGBM(0.8) + NN GP(0.2) blend")
 
     # Compare 模式
     if args.ensemble == "compare":
@@ -924,7 +924,7 @@ def main():
         eval_top5({s: gp_scores[i] for i, s in enumerate(stock_ids)}, "NN GP v2")
         lgbm_arr = np.array([lgbm_scores.get(s, 0) for s in stock_ids])
         def norm2(s): return (s - s.min()) / (s.max() - s.min() + 1e-9)
-        blend = 0.7 * norm2(lgbm_arr) + 0.3 * norm2(gp_scores)
+        blend = 0.8 * norm2(lgbm_arr) + 0.2 * norm2(gp_scores)
         eval_top5({s: blend[i] for i, s in enumerate(stock_ids)}, "LGBM(0.7)+NN(0.3)")
         # old models
         drop = [c for c in NEW_FEATS if c in panel.columns]
