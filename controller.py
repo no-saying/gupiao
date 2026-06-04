@@ -636,29 +636,20 @@ def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
             precision_ids.append(sid)
             psc.append(scv)
 
-    # ── 门控通过数 → 仓位决策 ──
+    # ── 门控通过数（信息参考，不强制减仓）──
     n_pass = len(precision_ids)
     gate_topk = args.topk
     cash_pct = 0.0
-
     if n_pass >= 10:
-        gate_topk = 5
-        print(f"  Gate: {n_pass} passed → FULL ({gate_topk} stocks)")
+        print(f"  Gate: {n_pass} passed — market healthy")
     elif n_pass >= 5:
-        gate_topk = min(4, n_pass)
-        cash_pct = 0.15
-        print(f"  Gate: {n_pass} passed → CAUTIOUS ({gate_topk} stocks, {cash_pct:.0%} cash)")
+        print(f"  Gate: {n_pass} passed — market normal")
     elif n_pass >= 3:
-        gate_topk = min(3, n_pass)
-        cash_pct = 0.30
-        print(f"  Gate: {n_pass} passed → DEFENSIVE ({gate_topk} stocks, {cash_pct:.0%} cash)")
+        print(f"  Gate: {n_pass} passed — market weak")
     elif n_pass >= 1:
-        gate_topk = min(2, n_pass)
-        cash_pct = 0.50
-        print(f"  Gate: {n_pass} passed → MINIMAL ({gate_topk} stocks, {cash_pct:.0%} cash)")
+        print(f"  Gate: {n_pass} passed — market very weak")
     else:
-        print(f"  Gate: 0 passed → CASH (market too weak)")
-        return [], [1.0]  # 空仓
+        print(f"  Gate: 0 passed — extreme caution, but still picking top scores")
 
     # ── 纳什均衡（门控通过>=5只才做多样化）──
     if stock_idx_map is not None and X_lt is not None and len(precision_ids) >= 5:
@@ -879,10 +870,6 @@ def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
     else:
         weights = np.ones(len(sel_ids)) / len(sel_ids)
 
-    # ── 应用门控现金仓位 ──
-    if cash_pct > 0:
-        weights = [w * (1.0 - cash_pct) for w in weights]
-
     return sel_ids, list(weights)
 
 
@@ -987,6 +974,8 @@ def main():
         dw = np.array(day_weights.get(n_days, [1.0])[:n_days])
         dw = dw / dw.sum()
         def norm(s): return (s - s.min()) / (s.max() - s.min() + 1e-9)
+        # 预检测可用辅助模型
+        aux_loaded = sum(1 for k in AUX_MODELS if (AUX_MODEL_DIR/f"portfolio_model_{k}.pt").exists())
         ensemble = np.zeros(300)
         lgbm_available_dates = sorted(lgbm_df['date'].unique())
         for i in range(n_days):
@@ -1005,7 +994,7 @@ def main():
             if lgbm_day is not None:
                 lgbm_dict = lgbm_day.set_index('stock_id')['lgb_score'].to_dict()
                 lgbm_day_arr = np.array([lgbm_dict.get(s, 0) for s in stock_ids])
-            # 融合 (支持动态 MoE)
+            # 融合：0.8 LGBM + 0.2 NN（支持动态 MoE）
             if args.moe:
                 regime = compute_market_regime(panel)
                 blend = dynamic_moe_blend(lgbm_day_arr, gp_day, regime)
@@ -1061,34 +1050,29 @@ def main():
         eval_top5({s: o3[i] for i, s in enumerate(stock_ids)}, "old 3model")
         return
 
-    # ── 辅助模型集成 ──
+    # ── 辅助模型集成（独立于主融合，最后 25% 混入）──
     aux_scores = np.zeros(300)
-    aux_loaded = 0
-    for aux_name, aux_w in AUX_MODELS.items():
+    aux_loaded = sum(1 for k in AUX_MODELS if (AUX_MODEL_DIR/f"portfolio_model_{k}.pt").exists())
+    for aux_name in AUX_MODELS:
         aux_path = AUX_MODEL_DIR / f"portfolio_model_{aux_name}.pt"
         if aux_path.exists():
             try:
-                s = load_predict(aux_path, X_lt, 57)
-                aux_scores += s
-                aux_loaded += 1
-            except:
-                pass
+                aux_scores += load_predict(aux_path, X_lt, 57) / aux_loaded
+            except: pass
     if aux_loaded > 0:
-        aux_scores /= aux_loaded
-        print(f"  Aux models loaded: {aux_loaded} ({', '.join(k for k in AUX_MODELS if (AUX_MODEL_DIR/f'portfolio_model_{k}.pt').exists())})")
+        print(f"  Aux models: {aux_loaded} loaded")
 
     # ── 最终分数 ──
     if nn_scores is not None:
         scores = nn_scores
-        # 混入辅助模型信号
         if aux_loaded > 0:
-            def _norm(s): return (s - s.min()) / (s.max() - s.min() + 1e-9)
-            scores = 0.75 * scores + 0.25 * _norm(aux_scores)
+            def _n(s): return (s - s.min()) / (s.max() - s.min() + 1e-9)
+            scores = 0.75 * scores + 0.25 * _n(aux_scores)
     elif is_lgbm:
         scores = np.array([lgbm_scores.get(s, -999) for s in stock_ids])
         if aux_loaded > 0:
-            def _norm(s): return (s - s.min()) / (s.max() - s.min() + 1e-9)
-            scores = 0.75 * _norm(scores) + 0.25 * _norm(aux_scores)
+            def _n(s): return (s - s.min()) / (s.max() - s.min() + 1e-9)
+            scores = 0.75 * _n(scores) + 0.25 * _n(aux_scores)
     else:
         print("[ERROR] No scores"); return
 
