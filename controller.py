@@ -31,8 +31,8 @@ AUX_MODELS = {
 }
 # 短窗口"当前市场专家" (仅学近期数据，对当前热点极度敏感)
 SHORT_WIN_MODELS = {
-    "sw60_focal": 0.20,   # 60天短窗，Sharpe 1.39
-    "sw120_top1": 0.10,   # 120天中窗，Sharpe 0.79
+    "sw60_pinball": 0.25,  # 60天 pinball，Sharpe 2.62 🏆
+    "sw60_focal": 0.15,    # 60天 focal，Sharpe 1.39
 }
 AUX_MODEL_DIR = Path("models")
 
@@ -1072,12 +1072,12 @@ def main():
     def _n(s): return (s - s.min()) / (s.max() - s.min() + 1e-9)
     expert_blend = np.zeros(300)
     if n_sw > 0:
-        expert_blend += 0.20 * _n(sw_scores / n_sw)  # 短窗高权重
+        expert_blend += 0.25 * _n(sw_scores / n_sw)  # 短窗（Sharpe 2.62+1.39）
     if n_aux > 0:
-        expert_blend += 0.10 * _n(aux_scores / n_aux)  # 辅助低权重
+        expert_blend += 0.10 * _n(aux_scores / n_aux)  # 辅助模型
     expert_active = (n_sw > 0) or (n_aux > 0)
     if expert_active:
-        print(f"  Experts: {n_sw} short-win + {n_aux} aux (blend 20%+10%)")
+        print(f"  Experts: {n_sw} short-win + {n_aux} aux (blend 25%+10%)")
 
     # ── 最终分数 ──
     if nn_scores is not None:
