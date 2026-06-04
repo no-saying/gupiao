@@ -23,6 +23,14 @@ GP_WEIGHTS = {
     "seed42_f1": 0.032, "seed42_f2": 0.000, "seed42_f3": 0.000, "seed42_f4": 0.248,
     "g787_f1": 0.000, "g787_f2": 0.000, "g787_f3": 0.000, "g787_f4": 0.070,
 }
+# 辅助模型 (pinball=极端涨幅, top1=最强股, focal=top5%概率)
+AUX_MODELS = {
+    "pinball": 0.15,  # 极端涨幅预测
+    "top1": 0.10,     # 当日最强股
+    "focal": 0.10,    # top 5% 概率
+}
+AUX_MODEL_DIR = Path("models")
+
 NEW_FEATS = {'gap_ratio', 'close_pos', 'intraday_range', 'streak_up', 'streak_down', 'vol_ret_corr_10d'}
 EXCLUDE = {'open', 'high', 'low', 'close', 'preclose', 'volume', 'amount',
            'adjustflag', 'turn', 'tradestatus', 'pctChg', 'peTTM', 'pbMRQ',
@@ -224,6 +232,94 @@ def load_predict(path, X_np, n_features=None):
     with torch.no_grad():
         s, _ = model(X_t, m_t)
     return s.squeeze(0).cpu().numpy()
+
+
+# =============================================================================
+# OOF Stacking 元模型 — 学习最优融合权重
+# =============================================================================
+
+def train_stacking_meta(lgbm_scores_dict: dict, nn_scores_list: list,
+                        stock_ids: list, panel, lookback: int = 120):
+    """
+    用历史数据训练一个轻量 LGBM 元模型，学习如何组合多个子模型的分数。
+
+    输入:
+      lgbm_scores_dict: {date: {stock_id: score}} LGBM 历史分数
+      nn_scores_list: [{date: {stock_id: score}}] 每个 NN 子模型的分数
+    输出:
+      meta_model: 训练好的 LGBM 模型
+    """
+    import lightgbm as lgb
+    # 构建训练数据
+    rows = []
+    all_dates = sorted(lgbm_scores_dict.keys())
+    if len(all_dates) < lookback:
+        return None
+
+    for date in all_dates[-lookback:]:
+        for sid in stock_ids:
+            lgb_score = lgbm_scores_dict.get(date, {}).get(sid, None)
+            if lgb_score is None:
+                continue
+            # 收集所有 NN 子模型分数
+            nn_features = {}
+            for i, nn_dict in enumerate(nn_scores_list):
+                nn_features[f'nn_{i}'] = nn_dict.get(date, {}).get(sid, 0.0)
+
+            # 获取真实收益作为 label
+            try:
+                sd = panel.xs(sid, level='stock_id')
+                sd_dates = sd.index.get_level_values('date')
+                idx = sd_dates.get_loc(date)
+                if idx + 4 < len(sd):
+                    t1_open = float(sd['open'].iloc[idx + 1])
+                    t5_open = float(sd['open'].iloc[idx + 4])
+                    label = (t5_open - t1_open) / max(t1_open, 1e-8)
+                else:
+                    continue
+            except:
+                continue
+
+            row = {'stock_id': sid, 'date': date, 'lgb_score': lgb_score,
+                   'label': label}
+            row.update(nn_features)
+            rows.append(row)
+
+    if len(rows) < 500:
+        return None
+
+    df = pd.DataFrame(rows)
+    feature_cols = ['lgb_score'] + [c for c in df.columns if c.startswith('nn_')]
+
+    # 按日期排序，用最后 20% 做验证
+    dates_sorted = sorted(df['date'].unique())
+    split = int(len(dates_sorted) * 0.8)
+    train_dates = set(dates_sorted[:split])
+    val_dates = set(dates_sorted[split:])
+
+    train_df = df[df['date'].isin(train_dates)]
+    val_df = df[df['date'].isin(val_dates)]
+
+    X_tr = train_df[feature_cols].values.astype(float)
+    y_tr = train_df['label'].values.astype(float)
+    grp_tr = train_df.groupby('date').size().values
+
+    X_val = val_df[feature_cols].values.astype(float)
+    y_val = val_df['label'].values.astype(float)
+
+    print(f"  [Stacking] Training meta-model on {len(train_df)} samples ({len(feature_cols)} features)...")
+    meta = lgb.LGBMRegressor(
+        n_estimators=100, num_leaves=31, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        random_state=42, verbose=-1,
+    )
+    meta.fit(X_tr, y_tr)
+    # 简单评估
+    pred_val = meta.predict(X_val)
+    from scipy.stats import spearmanr
+    ic, _ = spearmanr(pred_val, y_val)
+    print(f"  [Stacking] Val Spearman IC: {ic:.4f}")
+    return meta, feature_cols
 
 
 # =============================================================================
@@ -514,8 +610,9 @@ def bdc_select_and_weight(pool_ids, pool_sc, panel, top_k=5, risk_penalty=0.30,
 def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
                              panel, args, n_features=57, stock_idx_map=None,
                              X_lt=None):
-    """原有的精度门控+波动率过滤+选股权重逻辑。"""
-    # ── 精度门控 + 超买过滤 ──
+    """精度门控 + 波动率过滤 + 选股权重。门控通过数决定仓位大小。"""
+    # ── 精度门控：收益>0 + 回撤>-8% ──
+    # 参考竞赛分享：门控严=命中率高，通过数决定仓位
     precision_ids, psc = [], []
     for idx, sid in enumerate(pool_ids):
         scv = pool_sc[idx]
@@ -526,13 +623,11 @@ def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
         except:
             ret_5d, dd = 0, -0.01
 
-        # 超买过滤 (RSI>75 或 10日涨幅>20%)
         if getattr(args, 'no_overbought', False):
             try:
                 rsi_val = float(sd['rsi_14'].iloc[-1]) if 'rsi_14' in sd.columns else 50
                 ret_10d = sd['pctChg'].iloc[-10:].sum() / 100.0
                 if rsi_val > 75 or ret_10d > 0.20:
-                    print(f"    overbought skip {sid}: RSI={rsi_val:.0f} ret_10d={ret_10d:.1%}")
                     continue
             except:
                 pass
@@ -541,11 +636,33 @@ def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
             precision_ids.append(sid)
             psc.append(scv)
 
-    # ── 纳什均衡（放在门控之后，在约10~15只里做多样化）──
-    # 池子太小(<7)跳过；池子适中(7~10)放松阈值；池子够大(>10)正常触发
-    if stock_idx_map is not None and X_lt is not None and len(precision_ids) >= 7:
-        lam = max(0, min(1, args.game)) if args.game is not None else None
-        # 用 X_lt 的实际特征数
+    # ── 门控通过数 → 仓位决策 ──
+    n_pass = len(precision_ids)
+    gate_topk = args.topk
+    cash_pct = 0.0
+
+    if n_pass >= 10:
+        gate_topk = 5
+        print(f"  Gate: {n_pass} passed → FULL ({gate_topk} stocks)")
+    elif n_pass >= 5:
+        gate_topk = min(4, n_pass)
+        cash_pct = 0.15
+        print(f"  Gate: {n_pass} passed → CAUTIOUS ({gate_topk} stocks, {cash_pct:.0%} cash)")
+    elif n_pass >= 3:
+        gate_topk = min(3, n_pass)
+        cash_pct = 0.30
+        print(f"  Gate: {n_pass} passed → DEFENSIVE ({gate_topk} stocks, {cash_pct:.0%} cash)")
+    elif n_pass >= 1:
+        gate_topk = min(2, n_pass)
+        cash_pct = 0.50
+        print(f"  Gate: {n_pass} passed → MINIMAL ({gate_topk} stocks, {cash_pct:.0%} cash)")
+    else:
+        print(f"  Gate: 0 passed → CASH (market too weak)")
+        return [], [1.0]  # 空仓
+
+    # ── 纳什均衡（门控通过>=5只才做多样化）──
+    if stock_idx_map is not None and X_lt is not None and len(precision_ids) >= 5:
+        lam = max(0, min(1, args.game)) if args.game is not None else 0.25
         actual_n_features = X_lt.shape[-1] if hasattr(X_lt, 'shape') else n_features
         print(f"  Nash eq (λ={lam:.3f}, gate-pool={len(precision_ids)}, feats={actual_n_features})...")
         try:
@@ -635,8 +752,8 @@ def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
                 print(f"  Industry diverse: {rej} replaced (max {max_per_ind}/industry)")
             final_ids, fsc = diverse_ids, diverse_sc
 
-    # 选 top K
-    topk = min(args.topk, 5)
+    # 选 top K（使用门控决策的仓位数量）
+    topk = gate_topk
     if len(final_ids) >= topk:
         order = np.argsort(fsc)[-topk:]
         sel_ids = [final_ids[i] for i in order]
@@ -761,6 +878,10 @@ def legacy_select_and_weight(pool_ids, pool_sc, pool, valid, scores, stock_ids,
         weights = list(weights_arr)
     else:
         weights = np.ones(len(sel_ids)) / len(sel_ids)
+
+    # ── 应用门控现金仓位 ──
+    if cash_pct > 0:
+        weights = [w * (1.0 - cash_pct) for w in weights]
 
     return sel_ids, list(weights)
 
@@ -940,11 +1061,34 @@ def main():
         eval_top5({s: o3[i] for i, s in enumerate(stock_ids)}, "old 3model")
         return
 
+    # ── 辅助模型集成 ──
+    aux_scores = np.zeros(300)
+    aux_loaded = 0
+    for aux_name, aux_w in AUX_MODELS.items():
+        aux_path = AUX_MODEL_DIR / f"portfolio_model_{aux_name}.pt"
+        if aux_path.exists():
+            try:
+                s = load_predict(aux_path, X_lt, 57)
+                aux_scores += s
+                aux_loaded += 1
+            except:
+                pass
+    if aux_loaded > 0:
+        aux_scores /= aux_loaded
+        print(f"  Aux models loaded: {aux_loaded} ({', '.join(k for k in AUX_MODELS if (AUX_MODEL_DIR/f'portfolio_model_{k}.pt').exists())})")
+
     # ── 最终分数 ──
     if nn_scores is not None:
         scores = nn_scores
+        # 混入辅助模型信号
+        if aux_loaded > 0:
+            def _norm(s): return (s - s.min()) / (s.max() - s.min() + 1e-9)
+            scores = 0.75 * scores + 0.25 * _norm(aux_scores)
     elif is_lgbm:
         scores = np.array([lgbm_scores.get(s, -999) for s in stock_ids])
+        if aux_loaded > 0:
+            def _norm(s): return (s - s.min()) / (s.max() - s.min() + 1e-9)
+            scores = 0.75 * _norm(scores) + 0.25 * _norm(aux_scores)
     else:
         print("[ERROR] No scores"); return
 
@@ -1067,6 +1211,13 @@ def main():
                 print(f"  Cash buffer: {cash_pct*100:.0f}% (strength={signal_strength:.6f})")
         except Exception as e:
             print(f"  [warn] cash_buffer skipped: {e}")
+
+    # ── 空仓处理 ──
+    if len(sel_ids) == 0:
+        print(f"\n  >>> CASH POSITION: market too weak, no stocks selected <<<")
+        pd.DataFrame({"stock_id": [], "weight": []}).to_csv(args.output, index=False)
+        print(f"  SCORE = 0.0 (cash)\n")
+        return
 
     # ── 输出 ──
     print(f"\nSelected {len(sel_ids)} stocks:")

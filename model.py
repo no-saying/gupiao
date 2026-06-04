@@ -997,3 +997,95 @@ def sharpe_loss(
         return torch.tensor(0.0, device=device)
 
     return torch.stack(losses).mean()
+
+
+# ── 损失 8: Pinball (Quantile) Loss — 预测极端涨幅 ──────────
+
+def pinball_loss(
+    scores: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    quantile: float = 0.90,
+) -> torch.Tensor:
+    """
+    Pinball / Quantile Loss，专门预测收益率的高分位数 (q=0.90)。
+
+    用于识别"有10%概率涨超X%"的尾部爆炸型标的。
+    ρ_q(u) = u * (q - 1_{u<0})
+    """
+    if valid_mask is None:
+        valid_mask = torch.ones_like(targets)
+    B, N = scores.shape
+    device = scores.device
+    losses = []
+    for i in range(B):
+        valid_idx = (valid_mask[i] > 0.5).nonzero(as_tuple=True)[0]
+        if len(valid_idx) < 2:
+            continue
+        s, t = scores[i, valid_idx], targets[i, valid_idx]
+        diff = t - s
+        loss = torch.where(diff >= 0, quantile * diff, (quantile - 1) * diff)
+        losses.append(loss.mean())
+    if not losses:
+        return torch.tensor(0.0, device=device)
+    return torch.stack(losses).mean()
+
+
+# ── 损失 9: Top-1 Binary — 预测当日最强股 ─────────────────
+
+def top1_loss(
+    scores: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    pos_weight: float = 5.0,
+) -> torch.Tensor:
+    """
+    Binary cross-entropy for predicting the single best stock per day.
+    pos_weight=5.0: false negatives cost 5x more (很重要因为 1/300 极稀疏).
+    """
+    if valid_mask is None:
+        valid_mask = torch.ones_like(targets)
+    B, N = scores.shape
+    device = scores.device
+    losses, pos_w = [], torch.tensor(pos_weight, device=device)
+    for i in range(B):
+        valid_idx = (valid_mask[i] > 0.5).nonzero(as_tuple=True)[0]
+        if len(valid_idx) < 10:
+            continue
+        s, t = scores[i, valid_idx], targets[i, valid_idx].float()
+        losses.append(F.binary_cross_entropy_with_logits(s, t, pos_weight=pos_w))
+    if not losses:
+        return torch.tensor(0.0, device=device)
+    return torch.stack(losses).mean()
+
+
+# ── 损失 10: Focal Loss — 预测是否会进 top 5% ─────────────
+
+def focal_loss(
+    scores: torch.Tensor,
+    targets: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    gamma: float = 2.0,
+    alpha: float = 0.25,
+) -> torch.Tensor:
+    """
+    Focal Loss: -α(1-p_t)^γ log(p_t)
+    Label: 1 = stock return > 95th percentile, 0 otherwise.
+    γ=2 down-weights easy examples, α=0.25 handles class imbalance.
+    """
+    if valid_mask is None:
+        valid_mask = torch.ones_like(targets)
+    B, N = scores.shape
+    device = scores.device
+    losses = []
+    for i in range(B):
+        valid_idx = (valid_mask[i] > 0.5).nonzero(as_tuple=True)[0]
+        if len(valid_idx) < 10:
+            continue
+        s, t = scores[i, valid_idx], targets[i, valid_idx].float()
+        bce = F.binary_cross_entropy_with_logits(s, t, reduction='none')
+        pt = torch.exp(-bce)
+        losses.append((alpha * (1 - pt) ** gamma * bce).mean())
+    if not losses:
+        return torch.tensor(0.0, device=device)
+    return torch.stack(losses).mean()

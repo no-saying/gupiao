@@ -65,7 +65,7 @@ from config import (
 )
 from data_loader import get_official_stock_ids, build_panel_from_official
 from features import engineer_features, make_window_samples, get_norm_stats
-from model import PortfolioPredictor, lambdarank_loss, pairwise_ranking_loss, listnet_loss, topk_listnet_loss, pcc_loss, sharpe_loss
+from model import PortfolioPredictor, lambdarank_loss, pairwise_ranking_loss, listnet_loss, topk_listnet_loss, pcc_loss, sharpe_loss, pinball_loss, top1_loss, focal_loss
 
 
 # =============================================================================
@@ -284,6 +284,32 @@ def augment_input(x: torch.Tensor, noise_std: float = 0.05,
     return corrupted
 
 
+def _make_top1_labels(y: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """将收益率转为 Top-1 二分类标签：当日最强股=1，其余=0。"""
+    B, N = y.shape
+    labels = torch.zeros_like(y)
+    for i in range(B):
+        valid = (mask[i] > 0.5).nonzero(as_tuple=True)[0]
+        if len(valid) < 2:
+            continue
+        best = valid[y[i, valid].argmax()]
+        labels[i, best] = 1.0
+    return labels
+
+
+def _make_explosive_labels(y: torch.Tensor, mask: torch.Tensor, pct: float = 0.95) -> torch.Tensor:
+    """将收益率转为"是否进 top 5%"二分类标签。"""
+    B, N = y.shape
+    labels = torch.zeros_like(y)
+    for i in range(B):
+        valid = (mask[i] > 0.5).nonzero(as_tuple=True)[0]
+        if len(valid) < 20:
+            continue
+        thresh = torch.quantile(y[i, valid], pct)
+        labels[i, valid] = (y[i, valid] >= thresh).float()
+    return labels
+
+
 def labels_to_ranks(y: torch.Tensor, mask: torch.Tensor, gaussian: bool = True) -> torch.Tensor:
     """
     将原始收益率转换为排名分数（用于 ListNet 训练）。
@@ -341,6 +367,11 @@ def train_epoch(model, loader, optimizer, scheduler, loss_fn, epoch: int,
         Xb, yb, mb, wb = Xb.to(DEVICE), yb.to(DEVICE), mb.to(DEVICE), wb.to(DEVICE)
 
         yb_target = labels_to_ranks(yb, mb) if use_rank_labels else yb
+        # 辅助模型标签转换
+        if loss_fn.__name__ == "top1_loss":
+            yb_target = _make_top1_labels(yb_target, mb)
+        elif loss_fn.__name__ == "focal_loss":
+            yb_target = _make_explosive_labels(yb_target, mb)
 
         # 数据增强：加噪声 + 时间步掩码，防止过拟合
         if _AUGMENT_ENABLED:
@@ -424,6 +455,9 @@ def train_model(
         "topk_listnet": topk_listnet_loss,
         "pcc": pcc_loss,
         "sharpe": sharpe_loss,
+        "pinball": pinball_loss,
+        "top1": top1_loss,
+        "focal": focal_loss,
     }
     loss_fn = loss_map.get(loss_name, listnet_loss)
 
@@ -704,7 +738,7 @@ def main():
                         help="强制重新下载所有数据（清除缓存）")
     parser.add_argument("--epochs", type=int, default=N_EPOCHS,
                         help=f"训练轮数（默认: {N_EPOCHS}）")
-    parser.add_argument("--loss", choices=["lambdarank", "pairwise", "listnet", "topk_listnet", "pcc", "sharpe"],
+    parser.add_argument("--loss", choices=["lambdarank", "pairwise", "listnet", "topk_listnet", "pcc", "sharpe", "pinball", "top1", "focal"],
                         default="listnet",
                         help="损失函数: lambdarank/pairwise/listnet(推荐)/topk_listnet")
     parser.add_argument("--lr", type=float, default=LR,

@@ -2,556 +2,247 @@
 
 > 赛题：基于沪深 300 成分股历史数据，预测未来一周（T+1~T+5）收益最高的 ≤5 只股票组合。
 > 队伍：中州奶龙
+> 最后更新：2026-06-05
 
 ---
 
-## 一、项目架构总览
+## 一、当前版本状态
 
-```
-原始 OHLCV 数据
-     │
-     ▼
-特征工程 (80维) ───────────────────────────────┐
-     │                                          │
-     ▼                                          ▼
-LightGBM Ranker (截面排序) ──┐              NN Ensemble (12个子模型)
-     │                       │                  │
-     ▼                       ▼                  ▼
-lgb_score (百分位)     blend = 0.7*lgb + 0.3*nn
-     │                       │
-     ▼                       ▼
-候选池 Top40 ←── 分数融合 (lgbm-nn / lgbm / gp)
-     │
-     ▼
-精度门控 (动量>0, 回撤>-8%)
-     │
-     ├── (可选) 纳什均衡多样化 ──→ embedding余弦相似度 + 博弈论
-     │
-     ├── (可选) 超买过滤 ──→ RSI>75或10d>20%排除
-     │
-     ├── (可选) 行业分散 ──→ 同行业最多N只
-     │
-     ▼
-波动率过滤
-     │
-     ▼
-Top-5 选股 → 权重分配 (softmax/bdc/inv_vol/equal)
-     │
-     ├── (可选) 零均值居中
-     ├── (可选) 现金仓位
-     │
-     ▼
-output/result.csv → score_self.py → Final Score
-```
+### 1.1 版本来源
 
----
+基于 `/root/gupiao_backup_20260603_234410`（v2 生产版），在此之上做了三项改进。
 
-## 二、模型架构
-
-### 2.1 NN 模型 (model.py)
-
-```
-输入 (B, N=300, T=60, F=73)
-  │
-  ├─ TimeEncoder (共享 BiGRU, 2层, d_model=128)
-  │   每只股票独立编码 → (B*300, 128)
-  │   (可选：Bahdanau Attention 时序池化)
-  │
-  ├─ MarketGate (可选) → 从embedding均值推导市场状态 → sigmoid门控
-  │
-  ├─ CrossSectionalTransformer ×2 (Pre-LN, 8 heads, d_ff=256)
-  │   股票间自注意力 → (B, 300, 128)
-  │
-  └─ ScoreHead: Linear(128→64) → GELU → Dropout → Linear(64→1)
-       输出 (B, 300) 每只股票预测分数
-```
-
-**训练配置：**
-- 3 个随机种子 × 4 折 TSCV = **12 个子模型**
-- 种子 791/42: `topk_listnet` loss, 时间衰减 decay=2.0
-- 种子 787: `lambdarank` loss
-- OneCycleLR, FP16 AMP, 梯度裁剪 max_norm=1.0
-- Early stopping patience=50, 最大 300 epochs
-- 总训练时间: ~2 小时
-
-### 2.2 LightGBM Ranker
-
-- `lambdarank` objective, 500 trees, num_leaves=63
-- 特征与 NN 共享同一套 73 维 panel
-- 缓存至 `models/lgbm_ranker.txt`（`--no-cache` 强制重训）
-- 训练数据: 最近 576 个交易日，label = 未来 5 日收益十分位
-
-### 2.3 融合策略
-
-```python
-# 默认: 0.7 * LGBM + 0.3 * NN
-blend = 0.7 * norm(lgbm_score) + 0.3 * norm(nn_score)
-```
-
-两种独立 scoring 方法互补：LGBM 擅长捕捉截面排序，NN 擅长时序模式。
-
----
-
-## 三、特征工程 (73维)
-
-### 3.1 特征演化
-
-| 版本 | 维度 | 新增 | 效果 |
-|:----|:----:|:-----|:----|
-| v0 (初始) | 57 | 基础量价+技术指标(RSI/MACD/KDJ/BB/ATR/OBV) | Sharpe 1.44 |
-| v1 | 57+4 | 截面排名(ret_5d/20d/vol_5d/rsi_rank) | 基础 |
-| v2 | 57+4+12 | 4指数×3窗口(SSE50/CSI500/ChiNext/SSE) | 含市场联动 |
-| v3 | 57+4+12+6 | 行业特征(ind_ret/alpha/ind_vol/industry_size) | 含行业信息 |
-| v4 (+日历+截面) | **70** | wday_0~3/month_sin_cos/is_month_end/is_cny_before_after/excess_return_1d/cs_rank_close_volume/industry_rank_return | **Sharpe 1.56** |
-| v5 (+调整日+量价背离) | **73** | is_rebalance_soon/divergence_bull/divergence_bear | Sharpe 1.52 |
-| **v6 (+微观结构)** | **78** | **amihud_illiq/ret_skew_20d/ret_kurt_20d/hl_spread/hl_spread_20d** | Sharpe 1.72 |
-| **v7 (+小波分解)** | **80** | **wavelet_trend/wavelet_noise** | Sharpe 1.72 (持平) |
-
-### 3.2 特徵分类
-
-| 类别 | 维度 | 具体因子 |
-|:-----|:----:|:---------|
-| 动量 | 4 | ret_5d/10d/20d/60d |
-| 波动率 | 3 | vol_5d/10d/20d |
-| 均线偏离 | 4 | ma5/10/20/60_dev |
-| 量价 | 5 | volume_ratio_5/20, turn_change, gap_ratio, amplitude |
-| 技术指标 | 12 | RSI, MACD(signal/hist), KDJ(K/D/J), OBV, WR, BB(dev/width), ATR |
-| 风险位置 | 4 | max_dd_20d, price_position, close_pos, intraday_range |
-| 走势 | 3 | streak_up/down, vol_ret_corr_10d |
-| 截面排名 | 4 | ret_5d/20d_rank, vol_5d_rank, rsi_rank |
-| 超额收益 | 1 | excess_return_1d (个股-市场平均) |
-| 截面排名 | 2 | cs_rank_close, cs_rank_volume |
-| 行业 | 7 | ind_ret_5d/20d, alpha_ret_5d/20d, ind_vol_5d, industry_size, industry_rank_return |
-| 指数 | 12 | SSE50/CSI500/ChiNext/SSE_Composite × 3窗口(5/10/20d) |
-| 市场 | 1 | beta_60d |
-| 日历 | 9 | wday_0~3, month_sin/cos, is_month_end, is_cny_before/after, **is_rebalance_soon** |
-| 量价背离 | 2 | **divergence_bull, divergence_bear** |
-| 微观结构 | 5 | **amihud_illiq, ret_skew_20d, ret_kurt_20d, hl_spread, hl_spread_20d** |
-| 小波分解 | 2 | **wavelet_trend, wavelet_noise** |
-
----
-
-## 四、选股管线 — 4层过滤 + 博弈论
-
-### 第1层: 精度门控 (Precision Gate)
-
-所有候选股需同时满足：
-```
-1. 近5日平均涨幅 > 0%      (动量条件)
-2. 近20日最大回撤 > -8%    (风险条件)
-```
-
-这是最核心的过滤器，回测中效果最显著。原理：动量溢价只存在于上涨趋势中，深度回撤的股票可能进入下跌通道。
-
-### 第2层: 纳什均衡多样化 (Game Theory)
-
-```python
-效用(组合) = 平均分数 - λ × 平均内部相似度
-```
-
-- 相似度矩阵: NN embedding 余弦相似度 (300×300)
-- λ 自适应: 候选池 7-10 只时 λ×0.6, >10 只时正常
-- 穷举搜索: 从候选池中选择使效用最大化的子集
-- 效果: 同一策略不加纳什 Sharpe=0.95，加纳什后 1.44 (+0.49)
-
-### 第3层: 过滤器 (可选)
-
-| 过滤器 | 参数 | 效果 |
-|:-------|:-----|:------|
-| 超买过滤 | `--no-overbought` | RSI>75 或 10日涨幅>20%排除。防追高。 |
-| 行业分散 | `--diverse-industry N` | 同行业最多N只。降集中度。 |
-| 宏观门控 | `--market-state` | 20日均线下行时切防御板块(已移除,改为`--max-score`) |
-
-### 第4层: 波动率过滤
-
-剔除波动率 > 全市场中位数 × 1.2 的股票。低波动率异象：同等收益下低波动股票表现更稳定。
-
-### 权重分配
-
-| 方式 | 公式 | 特点 |
-|:-----|:-----|:------|
-| **softmax** | exp((s-max(s))/0.3) / sum | 高分多配，低分少配，**绝对收益最高** |
-| inv_vol | 1/σ / sum(1/σ) | 波动率越低权重越高，**Sharpe最佳** |
-| equal | 1/N | 简单等权 |
-| bdc | clip(invested × raw/raw.sum, 0, 0.5) | 预测比例加权+单票上限 |
-
----
-
-## 五、运行模式与参数
-
-### 5.1 核心命令
+### 1.2 运行
 
 ```bash
-# ── 默认（0.8 LGBM + 0.2 NN, 14周100%胜率）──
 python controller.py
-
-# ── LGBM_Nash 纯LGBM高收益（Score 0.1718, Sharpe 1.53）──
-python controller.py --weight softmax
-
-# ── Blend Nash 稳健（Sharpe 1.42, 92.9%胜率）──
-python controller.py --weight inv_vol
-
-# ── 极限分数模式（不设过滤, 追求极值）──
-python controller.py --max-score --game 0.25 --weight softmax
-
-# ── 对比所有策略 ──
-python controller.py --ensemble compare
+# SCORE ≈ 0.125（当前周，与旧版持平但多一层防御）
 ```
 
-### 5.2 全部参数
+### 1.3 核心参数
 
-| 参数 | 默认 | 可选值 | 说明 |
-|:-----|:----:|:-------|:------|
-| `--ensemble` | `lgbm-nn` | lgbm/lgbm-nn/gp/compare | 模型融合方式 |
-| `--weight` | `bdc` | equal/softmax/inv_vol/bdc | 权重分配 |
-| `--game` | auto | float | 纳什均衡λ (默认自动: 根据拥挤度确定) |
-| `--moe` | — | flag | 动态MoE: HMM市场状态自适应LGBM/NN权重 |
-| `--confidence` | — | flag | 置信度建模: 集成方差高时自动减仓 |
-| `--hrp` | — | flag | 层次风险平价: 基于NN embedding聚类分配权重 |
-| `--multi-day` | 1 | 1-5 | 多日rolling预测天数 |
-| `--no-overbought` | — | flag | 超买过滤(RSI>75或10d>20%) |
-| `--diverse-industry` | — | int N | 同行业最多N只 |
-| `--cash-buffer` | — | float | 信号弱时保留现金比例 |
-| `--center` | — | flag | 零均值居中消除偏差 |
-| `--max-score` | — | flag | 极限分数:宏观分析+赛道拥挤+博弈 |
-| `--moe` | — | flag | 动态MoE: HMM市场状态自适应LGBM/NN权重 |
-| `--no-cache` | — | flag | 强制重训LGBM |
-| `--topk` | 5 | 1-5 | 选股数量 |
-| `--output` | output/result.csv | path | 输出路径 |
+| 参数 | 值 |
+|:-----|:---|
+| LGBM 标签 | `open[t+4] / open[t] - 1` |
+| LGBM 超参 | Optuna: lr=0.0196, leaves=68, trees=350 |
+| NN 模型 | 12 v2 (3种子×4折 TSCV) |
+| **辅助模型** | **3 个 (pinball/top1/focal)** |
+| 融合方式 | 0.75×(0.8 LGBM + 0.2 NN) + 0.25×aux |
+| 权重 | GP固定 + bdc |
+| 选股 | 精度门控 → 纳什 → 波动率过滤 |
+| 门控 | 通过数决定仓位（FULL/CAUTIOUS/DEFENSIVE/MINIMAL/CASH） |
 
-### 5.3 训练
+---
+
+## 二、2026-06-05 改进记录
+
+### 2.1 三项改进
+
+| # | 改进 | 状态 | 效果 |
+|:--|:-----|:----|:-----|
+| 1 | OOF Stacking 元模型 | ✅ 代码就绪 | 函数 `train_stacking_meta()` 已添加 |
+| 2 | 辅助预测模型 | ✅ 已训练 | pinball(Sharpe0.37) + top1(0.54) + focal(0.27) |
+| 3 | 紧门控+空仓 | ✅ 已集成 | 门控通过数→仓位决策，lam bug修复 |
+
+### 2.2 新增损失函数 (model.py)
+
+| 损失 | 用途 | 标签 |
+|:-----|:-----|:-----|
+| `pinball_loss(q=0.90)` | 极端涨幅预测 | 连续收益率 |
+| `top1_loss` | 当日最强股预测 | 二元 (最强=1) |
+| `focal_loss` | top 5% 概率预测 | 二元 (top5%=1) |
+
+### 2.3 辅助模型
 
 ```bash
-# 完整训练（3种子×4折TSCV, ~2小时）
-python train.py --seed 791 --loss topk_listnet --decay 2.0 --tscv --batch-size 32
-python train.py --seed 42  --loss topk_listnet --decay 2.0 --tscv --batch-size 32
-python train.py --seed 787 --loss lambdarank    --tscv --batch-size 32
+python train.py --loss pinball --seed 791 --epochs 100 --batch-size 32
+python train.py --loss top1    --seed 791 --epochs 100 --batch-size 32
+python train.py --loss focal   --seed 791 --epochs 100 --batch-size 16
+```
+
+### 2.4 已知问题
+
+1. `--game` 未指定时 lam=None 导致崩溃 → 默认改为 0.25
+2. LGBM 缓存污染 → `rm models/lgbm_ranker.txt` 清理
+
+---
+
+## 三、参考代码分析
+
+### 3.1 Game-BDC2026（/tmp/Game-BDC2026）
+
+**架构**：三 Slot 集成 —— Slot1 DoubleEnsemble LGBM (272维) + Slot2 MASTER (Market-Gated Transformer) + Slot3 ALSTM (LSTM+Attention)
+
+**关键发现**：
+
+| # | 发现 | 我们是否已有 | 优先级 |
+|:--|:-----|:----------|:------|
+| 1 | **三异构模型 Rank 均值集成** | 有 LGBM+NN，缺第三异构 | 🟡 中 |
+| 2 | **正确标签**: `(open.shift(-5)-open.shift(-1))/open.shift(-1)` | ❌ LGBM 用的是 shift(-4) | 🔴 待讨论 |
+| 3 | DoubleEnsemble: M0全特征 + M1-M5 70%子集误差加权 | ✅ `--de` 已实现 | 🟢 已有 |
+| 4 | 5日 Rolling [0.4,0.25,0.15,0.12,0.08] | ✅ `--multi-day 5` | 🟢 已有 |
+| 5 | 零均值居中增强截面排序 | ✅ `--center` | 🟢 已有 |
+| 6 | PurgedKFold (embargo=10天) | ⚠️ TSCV gap=5天，可加 | 🟢 低 |
+| 7 | **PCC Loss 天花板**: 优化全部排序忽略 top-5 爆发力 | ⚠️ 我们的 NN 用 topk_listnet 部分缓解 | 🟡 中 |
+| 8 | MASTER-Q90 (Pinball Loss, q=0.90): 专门预测极端涨幅 | ❌ | 🔴 高 |
+| 9 | MASTER-Cls (Focal Loss): 二分类"会不会进 top 5%" | ❌ | 🔴 高 |
+
+### 3.2 gupiao_mirror3（/tmp/gupiao_mirror3）
+
+**架构**：多专家模型集成 —— 6 种专家 (Transformer/卷积/季节性/激进/布朗噪声/Neural GARCH) + Meta Aggregator + MC Dropout 推理
+
+**关键发现**：
+
+| # | 发现 | 耗时 | 优先级 |
+|:--|:-----|:----|:------|
+| 1 | MC Dropout: 推理时保持 dropout, 20 次前向取平均 | 推理 ×20 | 🟡 中 |
+| 2 | Stochastic Depth: 训练时随机跳过层, 推理时亮度缩放 | 训练+20% | 🟢 低 |
+| 3 | Neural GARCH: 神经网络估计时变波动率 | 重训 | 🟢 低 |
+| 4 | Meta Aggregator: 学习专家权重 (Attention over experts) | 需重训 | 🟡 中 |
+| 5 | MonthSeasonalExpert: 月份+股票季节性 embedding | 重训 | 🟢 低 |
+| 6 | BrownianNoiseExpert: 注入布朗噪声训练抗扰动 | 重训 | 🟢 低 |
+
+### 3.3 bdc2026（/tmp/bdc2026）
+
+官方教程仓库，基础参考。已采纳的：Stock Embedding、并行 Transformer（实验失败）、混合标签（回退了）。
+
+---
+
+## 四、可采纳改进（优先级排序）
+
+### 🔴 第一优先：低成本高收益
+
+**1. MASTER-Q90 预测模型**
+- 问题：当前模型系统性低估极端涨幅
+- 方案：复制 NN 模型，改用 Pinball Loss (q=0.90)，专门预测"未来一周可能暴涨的股票"
+- 工作量：新增 `pinball_loss()` 到 model.py + 训练 1 个种子
+- 预期效果：抓到 +15%+ 的爆发股，突破 R_total 天花板
+- 参考：TODO_3.md § 0.2
+
+**2. MASTER-Cls 二分类模型**
+- 问题：不知道哪些股票"大概率进 top 5%"
+- 方案：用 Focal Loss 训练二分类器，label = (未来5日收益 > 截面 95% 分位)
+- 工作量：新增 `focal_loss()` + 训练 1 个种子
+- 参考：TODO_3.md Phase 2
+
+**3. 标签公式审查**
+- Game-BDC2026 明确使用 `(open.shift(-5)-open.shift(-1))/open.shift(-1)`（T+1→T+5）
+- 我们 LGBM 用 `open.shift(-4)/open - 1`（T→T+4）
+- NN 用 `(open_t5 - open_t1)/open_t1`（T+1→T+5，正确）
+- **待决定**：LGBM 标签是否需要对齐？14 周回测证明旧标签有效（Sharpe 1.53）
+
+### 🟡 第二优先：中期改进
+
+**4. 第三异构模型（ALSTM）**
+- LSTM + Temporal Attention，轻量（~150K 参数），训练 1 小时
+- 与 LGBM + NN 形成三足鼎立，Rank 平均集成降方差
+- 参考：TODO_1.md Phase 5
+
+**5. 日历 + 截面特征扩充**
+- 周几 one-hot (4维)、月份 cyclical (2维)、月末/季末 (2维)、春节窗口 (2维)
+- 截面排名: excess_return_1d、cs_rank_close、cs_rank_volume、industry_rank_return
+- 预计新增 ~15 维
+- 参考：TODO_1.md P2-T2, P2-T3
+
+### 🟢 第三优先：长期储备
+
+**6. MC Dropout 推理**（已完成原型，效果不显著）
+**7. 对抗学习时间不变特征**（训练成本高）
+**8. DoubleEnsemble 升级**（已有 --de，未充分使用）
+**9. 市场情绪特征**（涨跌比、新高新低比）
+
+---
+
+## 五、竞赛分享对比分析
+
+来源：THU-BDC2026 参赛队伍经验分享。
+
+### 5.1 特征工程对比
+
+| 维度 | 他们 | 我们 | 差距 |
+|:-----|:-----|:-----|:-----|
+| 窗口覆盖 | 3,5,10,20,40 天 | 5,10,20,60 天 | 缺 3 天超短期 |
+| 截面特征 | 日排名、超额收益、市场情绪、涨跌比 | cs_rank_close/volume, excess_return_1d | 缺涨跌比 |
+| 外部数据 | 无 | 无 | 一致 |
+
+### 5.2 模型对比
+
+| 维度 | 他们 | 我们 | 差距 |
+|:-----|:-----|:-----|:-----|
+| 基线模型 | LGBM + HistGB + RF | LGBM only | 缺 HistGB/RF |
+| **核心融合** | **OOF Stacking（二层元模型）** | LGBM+NN 线性加权 | **最大差距** |
+| 辅助模型 | Top1 预测 + 短期爆发预测 | 无 | **缺辅助方向** |
+| 建模方式 | 收益预测和涨跌概率分开 | 统一排序模型 | 可以借鉴 |
+
+### 5.3 训练对比
+
+| 维度 | 他们 | 我们 | 差距 |
+|:-----|:-----|:-----|:-----|
+| TSCV | 4折, gap=5天, val=20天, train≥120天 | 4折, gap=5天, val=50天 | val更大 |
+| 种子 | 固定 20260416 | 3 个种子 (791/42/787) | 更丰富 |
+| 超参 | 默认值为主，调树数量 | Optuna 搜索 | 更精细 |
+| 重点 | 特征和标签设计 | 模型架构 | 方向不同 |
+
+### 5.4 组合策略对比
+
+| 维度 | 他们 | 我们 | 差距 |
+|:-----|:-----|:-----|:-----|
+| 筛选流程 | 候选池→精排→风险惩罚 | 候选池→精度门控→纳什→波动率 | 类似 |
+| **精度门控** | 收益>0 + **排名前25%** + **DD<3%** | 收益>0 + DD<8% | **他们严得多** |
+| 仓位 | 市场不好时空仓/少选 | 默认满仓5只 | **缺防御** |
+| 树数量 | 200-300棵 | 350棵(Optuna) | 类似 |
+
+### 5.5 关键差距总结
+
+1. **OOF Stacking** — 他们用多个基模型的 OOF 预测训练二层元模型，我们只是简单线性加权
+2. **辅助预测方向** — Top1 预测 + 短期爆发预测，两个独立子模型提供额外信号
+3. **涨跌概率分离** — 收益预测和涨跌方向分开建模
+4. **门控更严** — DD<3% + 排名前25%，比我们的 DD<8% 严格得多
+5. **空仓机制** — 市场不好主动空仓，不硬凑
+
+---
+
+## 六、14周回测记录
+
+| 排名 | 策略 | 权重 | Mean | Sharpe | WinRate |
+|:---:|:-----|:----:|:----:|:------:|:-------:|
+| 1 | **LGBM_Nash** | softmax | 0.0865 | **1.53** | **100%** |
+| 2 | BlendNash | inv_vol | 0.0828 | 1.36 | 92.9% |
+
+14周明细（LGBM_Nash softmax）:
+```
+W1 +0.2041  W2 +0.1223  W3 +0.0631  W4 +0.0015  W5 +0.1420
+W6 +0.0380  W7 +0.0145  W8 +0.1011  W9 +0.1072  W10 +0.1202
+W11 +0.0297 W12 +0.0304 W13 +0.0959 W14 +0.1416
 ```
 
 ---
 
-## 六、回测结果
+## 七、代码结构
 
-### 6.1 14周滚动回测 (2025-06 ~ 2026-05)
-
-测试方法: 每周滚动训练LGBM（Optuna调参）+ NN (Sharpe Loss) 12模型推理 → 选股 → 评分。
-LGBM超参数: `lr=0.0196, leaves=68, trees=350, reg=0.002`（Optuna 50轮搜索优化）。
-默认融合: `0.8 * LGBM + 0.2 * NN`（经比例搜索验证）。
-
-**80特征 + Optuna调参LGBM + Sharpe Loss NN**
-
-| 排名 | 策略 | 权重 | Mean | Median | Std | Min | Max | Sharpe | WinRate |
-|:---:|:-----|:----:|:----:|:------:|:---:|:---:|:---:|:------:|:-------:|
-| 1 | **LGBM_Nash** | **softmax** | **0.0865** | **0.0985** | 0.0566 | +0.0015 | 0.2041 | **1.53** | **100%** |
-| 2 | **BlendNash** | **inv_vol** | **0.0828** | **0.0929** | 0.0609 | -0.0053 | **0.2357** | **1.36** | 92.9% |
-| 3 | BlendNash | softmax | 0.0810 | 0.0890 | 0.0572 | -0.0298 | 0.1955 | 1.42 | 92.9% |
-| 4 | BlendNash | equal | 0.0809 | 0.0881 | 0.0586 | -0.0343 | 0.1955 | 1.38 | 92.9% |
-| 5 | LGBM_Nash | bdc | 0.0790 | 0.0944 | 0.0566 | -0.0213 | 0.2058 | 1.40 | 92.9% |
-| 6 | LGBM_Nash | inv_vol | 0.0796 | 0.0928 | 0.0599 | -0.0053 | **0.2357** | 1.33 | 92.9% |
-| 7 | LGBM_Nash | equal | 0.0779 | 0.0937 | 0.0558 | -0.0246 | 0.2058 | 1.40 | 92.9% |
-| 8 | FusionNash | inv_vol | 0.0797 | 0.0738 | 0.0655 | -0.0169 | **0.2357** | 1.22 | 92.9% |
-
-> LGBM_Nash softmax 是唯一100%胜率策略，14周每周正收益。Min=+0.0015。
-> Blend 比例搜索验证0.8/0.2为最优平衡点（0.7/0.3 Mean略高但Std更大）。
-
-### 6.2 特征升级与LGBM调参效果
-
-| 版本 | 特征 | LGBM_Nash Sharpe | 关键改进 |
-|:----|:----:|:----------------:|:---------|
-| 初始 57 | 量价+技术 | 1.44 | 基线 |
-| +日历+截面 70 | wday/CS/excess | **1.56** | 日历效应+截面信号 |
-| +调整日+背离 73 | rebalance/divergence | 1.52 | 成分股调整+量价背离 |
-| **+LGBM调参** | Optuna优化 | **1.53** | 超参数搜索（lr/leaves/trees/reg） |
-
-### 6.3 LGBM超参搜索（Optuna 50轮）
-
-```
-最佳RankIC: 0.4415
-最佳参数:
-  n_estimators: 350, num_leaves: 68, learning_rate: 0.0196
-  subsample: 0.738, colsample_bytree: 0.939
-  reg_lambda: 0.0022, reg_alpha: 0.0054, min_child_samples: 42
-```
-
-默认参数（`lr=0.05, leaves=63, trees=500, reg=0.1`）的RankIC约0.43，优化后提升至0.4415。
-
-### 6.4 14周Score明细
-
-**LGBM_Nash softmax（唯一100%胜率）**
-```
-W 1 +0.2041  W 2 +0.1223  W 3 +0.0631  W 4 +0.0015
-W 5 +0.1420  W 6 +0.0380  W 7 +0.0145  W 8 +0.1011
-W 9 +0.1072  W10 +0.1202  W11 +0.0297  W12 +0.0304
-W13 +0.0959  W14 +0.1416
-```
-
-**BlendNash inv_vol（Sharpe=1.36, Mean=0.0828）**
-```
-W 1 +0.1169  W 2 +0.0952  W 3 +0.1574  W 4 -0.0169
-W 5 +0.1349  W 6 +0.0257  W 7 +0.0030  W 8 +0.0902
-W 9 +0.1292  W10 +0.2357  W11 +0.0575  W12 +0.0209
-W13 +0.0811  W14 +0.1333
-```
-
-LGBM_Nash 14周全正，Min=+0.0015。BlendNash仅1周微亏(-0.0169)。
+| 文件 | 职责 |
+|:-----|:------|
+| `controller.py` | 主入口: LGBM训练→NN推理→融合→纳什→选股 |
+| `train.py` | NN训练: TSCV |
+| `model.py` | BiGRU+Transformer+7种loss |
+| `features.py` | 80维特征+窗口采样 |
+| `data_loader.py` | 数据下载+panel构建 |
+| `config.py` | 超参数 |
+| `score_self.py` | 评分脚本 |
 
 ---
 
-## 七、风险分析与博弈论
+## 八、备份
 
-### 7.1 `--max-score` 模式（极限分数）
+- 当前版本: `/root/gupiao_backup_20260603_234410`
+- 最新实验: `/root/gupiao_backup_20260604_030346`
+- 早期稳定: `/root/gupiao_final_20260602_233555`
 
-该模式追求绝对收益最大化，不设超买过滤，但增加宏观分析：
+## 九、参考仓库
 
-```
-python controller.py --max-score --game 0.25 --weight softmax
-```
-
-输出示例：
-```
-  极限分数模式 — 市场分析 + 博弈论
-  ==================================
-  宏观: 熊市 (20d=-4.7%, 5d=+0.5%)
-  赛道拥挤(top40):
-     电子: 8只(20%)
-     电力设备: 6只(15%)
-  博弈升级: λ→0.15(候选池仅9只)
-```
-
-**工作原理：**
-1. **宏观周期**: 用20日均线判断市场趋势（牛/震荡/熊），影响风偏
-2. **赛道拥挤度**: 分析top40候选股的行业分布，>25%视为拥挤
-3. **博弈升级**: 拥挤时自动上调λ（纳什强度），促使选择不同赛道
-4. **顶点预警**: 标记RSI>80且10日涨>25%的极端超买股（不排除，但提示风险）
-5. **核心不变**: 不设超买过滤，让高动量股进入组合（追求分数）
-
-### 7.2 6月1日实盘亏损复盘
-
-**选股**: 5只科技（华大九天RSI=77, 天孚通信10d+36%）
-**原因**: 科技板块极端拥挤 + 基金调仓抽血 + 模型无行业分散
-**改进**: 
-- `--no-overbought` → 华大九天RSI>75排除
-- `--diverse-industry 2` → 不会5只全科技
-- `--max-score` → 赛道拥挤检测+预警
-- **Sharpe从1.44提升至1.98**
-
-### 7.3 数据泄漏检测
-
-`test_window.py`: 3窗口滚动验证，对偶准确率0.505（随机0.500）
-结论：**无数据泄漏**
+- `/tmp/Game-BDC2026` — 三 Slot 集成方案（最全面，含详细诊断和 TODO）
+- `/tmp/gupiao_mirror3` — 多专家 MC Dropout 集成（架构创新最多）
+- `/tmp/bdc2026` — 官方教程基线
 
 ---
 
-## 八、纳什均衡详解（核心创新点）
-
-纳什均衡是本项目最大的单一贡献（Sharpe +0.49）。
-
-### 数学形式
-
-```
-max  U(S) = mean(score_i) - λ × mean(sim_ij)
-     S⊆C    i∈S                    i,j∈S, i≠j
-
-其中:
-  C = 候选池 (精度门控后约10只)
-  S = 选中的子集 (约4-5只)
-  sim_ij = stock_i 与 stock_j 的embedding余弦相似度
-  λ = 博弈强度 (默认0.25, 池子小时自动降低)
-```
-
-### 直觉理解
-
-- 第一项 `mean(score_i)`: 选择高分股票（追求收益）
-- 第二项 `-λ × mean(sim_ij)`: 惩罚相似股票（鼓励多样化）
-- 纳什均衡 = 每个股票在组合中的存在"对其他股票构成竞争"，类似博弈论中的混合策略均衡
-
-### 与均值-方差优化的关系
-
-```
-马科维茨: max  μ'w - γ w'Σw
-纳什选股: max  mean(S) - λ·mean_sim(S)
-                  ↑           ↑
-               预期收益    多样化惩罚(协方差替代)
-```
-
-相似度矩阵近似协方差矩阵，λ对应风险厌恶系数。
-
----
-
-## 九、参考来源
-
-- **Game-BDC2026** (PaikyHiean): DoubleEnsemble LGBM, 日历/截面特征, 零均值居中
-- **MASTER (AAAI 2024)**: Market-Guided Stock Transformer, PCC Loss, Market Gating
-- **Qlib Alpha158**: 158个alpha因子体系
-- **Behavioral Finance**: 处置效应 → 超买过滤; 动量因子 → 精度门控
-
----
-
-## 十、代码结构
-
-| 文件 | 行数 | 职责 |
-|:-----|:----:|:------|
-| `controller.py` | ~960 | 主入口: 数据加载→特征→LGBM→NN→融合→纳什→选股→输出 |
-| `train.py` | ~1000 | NN训练: TSCV/decay/augment/loss选择/模型保存 |
-| `model.py` | ~750 | GRU+Transformer+MarketGate+ScoreHead+所有loss函数 |
-| `features.py` | ~600 | 80维特征工程+窗口采样+标准化 |
-| `data_loader.py` | ~430 | 数据下载+panel构建+缓存+双向baostock补全 |
-| `score_self.py` | ~95 | 评分脚本(与比赛方一致) |
-| `config.py` | ~230 | 所有超参数 |
-| `window_test/backtest.py` | ~500 | 14周滚动回测 |
-| `optimize_lgbm.py` | ~90 | Optuna LGBM超参数搜索 |
-| `test_window.py` | ~170 | 数据泄漏检测 |
-
-### 模型文件
-
-```
-models/
-├── portfolio_model_g791_v2_fold[1-4].pt     80特征 topk_listnet (当前)
-├── portfolio_model_seed42_v2_fold[1-4].pt    80特征 topk_listnet (当前)
-├── portfolio_model_g787_v2_fold[1-4].pt      80特征 lambdarank (当前)
-├── lgbm_ranker.txt                           LightGBM缓存 (Optuna调参)
-└── backup_v1_57feat/                         旧版57特征模型(备查)
-```
-
-最后备份: /root/gupiao_final_20260602_233555
-
----
-
-## 十一、当前问题与改进方向
-
-### 11.1 核心矛盾：分数 vs 风控
-
-```
-追求分数 → 不设过滤 → 6月1日重演（单周-5%~-8%）
-加过滤器 → 保护回撤 → 分数从0.143降到0.081（-43%）
-```
-
-模型目前靠参数组合手动切换，没有自动平衡机制。
-
-### 11.2 行业数据不完整
-
-- ~20% 股票 industry 标记为 "Unknown"
-- 仅有一级行业分类，无二级/三级，无法做精细赛道轮动
-- 成分股调整用日历硬编码，无真实预期数据
-
-### 11.3 无"卖点"验证
-
-比赛 T+1 买入 T+5 卖出，但模型只选买什么，没有验证"为什么这些股票在下周会比别的涨得多"。优化的是历史相关性而非未来因果性。
-
-### 11.4 特征边际收益递减
-
-| 版本 | 特征 | Sharpe 变化 |
-|:----|:----:|:-----------:|
-| 57→70 | +13 | **+0.12** ✅ |
-| 70→73 | +3 | -0.04 ❌ |
-
-成分股调整和量价背离在理论上合理，但回测无显著贡献。73维已进入边际收益递减区。
-
-### 11.5 LGBM 每次窗口从零训练
-
-14周回测中 LGBM 每次重新训练，耗时占 80%+。应改为增量更新或滑动窗口。
-
-### 11.6 纳什 λ 手工参数
-
-`--game 0.25` 凭经验设定。应根据候选池的实际分散度自动确定——池子越集中 λ 越大。当前虽有小池子降权的启发式规则，但不够系统化。
-
-### 11.7 无日內/高频信号
-
-所有特征基于日线。尾盘异动、开盘跳空、盘中大单完全缺失。有 Level-2 可构建更丰富的"聪明钱"因子。
-
-### 11.8 评分规则偏差
-
-`score_self.py` 用开盘价计算，真实交易不可能全以开盘价成交。模型可能学到"挑开盘跳空大的股票"，而非真正有趋势的股票。
-
-### 11.9 无置信度输出
-
-模型输出标量分数，但没有告诉用户这个分数有多可靠。`--cash-buffer` 是简单启发式，非真正的概率建模。
-
-### 11.10 无市场状态学习
-
-`--max-score` 用20日均线判断牛/熊是硬编码规则。模型本身没学到在不同市场状态下应有不同选股策略。MASTER 论文的 Market Gating 试图解决，需重训验证。
-
-### 11.11 改进优先级
-
-| 优先级 | 问题 | 思路 |
-|:-----:|:-----|:------|
-| 🔴 高 | 纳什 λ 自动确定 | 根据候选池相似度矩阵特征值自动计算 |
-| 🔴 高 | 置信度建模 | 用模型集成方差作为置信度，低时自动减仓 |
-| 🟡 中 | 行业数据补全 | 对接更完整的行业分类数据 |
-| 🟡 中 | LGBM 增量训练 | 缩短回测时间 |
-| 🟢 低 | 特征继续扩充 | 边际收益已低，不值得 |
-| 🟢 低 | 分日预测 | 需改训练管线，工作量与收益不确定 |
-
----
-
-## 十二、高阶改进方向（专家建议）
-
-以下方向来自外部量化专家评审，供下一阶段迭代参考。
-
-### 12.1 特征工程：从量价到微观结构代理
-
-OHLCV 中还蕴藏着更深层的市场微观结构信息：
-
-**Amihud 缺乏流动性指标**
-```
-Amihud = |Return| / Volume
-```
-衡量单位成交量能推动多少价格变化。A股中流动性枯竭往往是暴跌前兆，或低流动性溢价的来源。
-
-**Corwin-Schultz 买卖价差估计**
-仅用每日 High/Low 推导隐含的 Bid-Ask Spread，反映真实交易摩擦。
-
-**高阶矩：偏度与峰度**
-A股散户具有显著的"彩票型偏好"（炒小盘妖股）。过去20天收益率偏度极高的股票往往未来跑输（被过度炒作）。
-
-**时频域分解**
-用小波变换 (Wavelet) 或 EMD 将 Close 序列分解为"低频趋势"+"高频噪声"。当前 MA 均线是粗糙的低频滤波，时频分解可提取更纯粹的动量因子。
-
-### 12.2 模型架构：时空图卷积 + 自监督预训练
-
-**时空图卷积网络 (ST-GCN / GAT)**
-当前 Transformer 计算隐式的全连接注意力，缺乏对 A 股"板块联动/产业链传导"的显式建模。将 300 只股票视为图节点，边权重用过去 60 天动态皮尔逊相关系数，用 GAT 进行截面信息传递，能更好捕捉"领涨股带动跟风股"的 Lead-lag 效应。
-
-**掩码自监督预训练 (Masked Time-Series)**
-借鉴 NLP 的 BERT。用沪深 300 全部历史数据，随机 Mask 某几天，让模型重建缺失 K 线。通过无监督预训练深度理解 A 股价格演化流形，再用比赛 Label fine-tuning，缓解小样本过拟合。
-
-### 12.3 融合策略：动态混合专家 (MoE)
-
-**状态感知动态门控**
-当前 `0.7*LGBM + 0.3*NN` 固定权重在局部非最优。训练轻量级 Gating Network，输入市场波动率、大盘趋势等宏观特征，动态输出两者权重：
-- 极端单边牛市 → LGBM 更稳定（权重→0.9）
-- 震荡市/风格切换 → NN 时序捕捉更敏锐（权重→0.6）
-
-**正交化残差学习**
-串联而非并联：先用 LGBM 预测 Base Score，将 LGBM 预测结果或残差作为特征输入 NN，让 NN 专门拟合"LGBM 解释不了的非线性残差"，最大化异构模型互补性。
-
-### 12.4 选股博弈：层次风险平价 + 强化学习
-
-**层次风险平价 (HRP) + NN Embedding**
-当前 inv_vol 权重是简单的一阶矩方法。用 NN 的 128 维 Embedding 计算 300 只股票的距离矩阵，层次聚类，沿聚类树分配权重，使不同赛道风险贡献均等。完美契合"惩罚拥挤度"的博弈论初衷，且权重分配有严密数学保证。
-
-**可微 Top-K + 强化学习**
-当前纳什均衡用穷举搜索，候选池 10 只可行，扩到 30 只算力爆炸。引入强化学习 (PPO/SAC)：
-- State: 市场特征 + 备选池
-- Action: 选出 5 只股票 + 权重分配
-- Reward: 测试集 Sharpe 或带惩罚的组合收益
-实现选股与权重的端到端联合优化。
-
-### 12.5 损失函数：可微夏普比率
-
-当前训练用 lambdarank/topk_listnet，是代理目标（排序），非最终目标（组合收益）。
-
-**Differentiable Sharpe Ratio Loss**
-将 Batch 内模型输出经 Softmax 模拟资金权重 w，用真实未来收益计算组合预期收益 μ 和方差 σ²，Loss = -(μ/σ)。让神经网络在梯度反向传播时直接最大化夏普比率，比 LambdaRank 更契合"收益最高且控回撤"的要求。
-
-### 12.6 风险管理：HMM 市场状态识别
-
-当前精度门控（20日均线下行）是硬规则过滤。A 股市场风格切换（大盘价值↔小盘成长、牛↔猴↔熊）是非线性的。
-
-**HMM 隐马尔可夫模型**
-基于沪深 300 日收益率、波动率、成交量，训练 3-4 个隐状态的 HMM：
-- 状态1: 平稳上行
-- 状态2: 高波震荡  
-- 状态3: 流动性枯竭
-
-输出当日处于各状态的概率。状态3时强制触发 `--cash-buffer`，总权重缩到 0.3（保留 70% 现金）。这是规避系统性大跌最有效的降维打击手段。
