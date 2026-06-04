@@ -771,6 +771,8 @@ def main():
                         help="数据增强：训练时加高斯噪声+时间步掩码")
     parser.add_argument("--tscv", action="store_true",
                         help="时序交叉验证：4折训练，保存4个模型")
+    parser.add_argument("--data-days", type=int, default=0,
+                        help="仅使用最近N天数据训练 (0=全部, 60=短期, 120=中期)")
     args = parser.parse_args()
 
     # ---- 可选：强制重新下载 ----
@@ -858,6 +860,12 @@ def main():
 
     # rank_labels: 默认对 listnet 启用，除非 --no-rank-labels
     use_rank = not args.no_rank_labels if args.loss in ("listnet", "topk_listnet") else args.rank_labels
+
+    # ── 短窗口训练：仅保留最近 N 天数据 ──
+    if args.data_days > 0:
+        n_keep = min(args.data_days, len(X))
+        X, y, mask = X[-n_keep:], y[-n_keep:], mask[-n_keep:]
+        print(f"  [short-window] Using last {n_keep} samples (~{args.data_days} days)")
 
     # ==================================================================
     # 时序交叉验证（4折训练，每折保存一个模型）

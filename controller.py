@@ -29,6 +29,11 @@ AUX_MODELS = {
     "top1": 0.10,     # 当日最强股
     "focal": 0.10,    # top 5% 概率
 }
+# 短窗口"当前市场专家" (仅学近期数据，对当前热点极度敏感)
+SHORT_WIN_MODELS = {
+    "sw60_focal": 0.20,   # 60天短窗，Sharpe 1.39
+    "sw120_top1": 0.10,   # 120天中窗，Sharpe 0.79
+}
 AUX_MODEL_DIR = Path("models")
 
 NEW_FEATS = {'gap_ratio', 'close_pos', 'intraday_range', 'streak_up', 'streak_down', 'vol_ret_corr_10d'}
@@ -1050,29 +1055,39 @@ def main():
         eval_top5({s: o3[i] for i, s in enumerate(stock_ids)}, "old 3model")
         return
 
-    # ── 辅助模型集成（独立于主融合，最后 25% 混入）──
-    aux_scores = np.zeros(300)
-    aux_loaded = sum(1 for k in AUX_MODELS if (AUX_MODEL_DIR/f"portfolio_model_{k}.pt").exists())
-    for aux_name in AUX_MODELS:
-        aux_path = AUX_MODEL_DIR / f"portfolio_model_{aux_name}.pt"
-        if aux_path.exists():
-            try:
-                aux_scores += load_predict(aux_path, X_lt, 57) / aux_loaded
+    # ── 短窗口专家 + 辅助模型集成 ──
+    # SW60 (Sharpe 1.39) 高权重，SW120 (0.79) 中权重，辅助模型低权重
+    sw_scores = np.zeros(300); n_sw = 0
+    aux_scores = np.zeros(300); n_aux = 0
+    for name in SHORT_WIN_MODELS:
+        p = AUX_MODEL_DIR / f"portfolio_model_{name}.pt"
+        if p.exists():
+            try: sw_scores += load_predict(p, X_lt, 57); n_sw += 1
             except: pass
-    if aux_loaded > 0:
-        print(f"  Aux models: {aux_loaded} loaded")
+    for name in AUX_MODELS:
+        p = AUX_MODEL_DIR / f"portfolio_model_{name}.pt"
+        if p.exists():
+            try: aux_scores += load_predict(p, X_lt, 57); n_aux += 1
+            except: pass
+    def _n(s): return (s - s.min()) / (s.max() - s.min() + 1e-9)
+    expert_blend = np.zeros(300)
+    if n_sw > 0:
+        expert_blend += 0.20 * _n(sw_scores / n_sw)  # 短窗高权重
+    if n_aux > 0:
+        expert_blend += 0.10 * _n(aux_scores / n_aux)  # 辅助低权重
+    expert_active = (n_sw > 0) or (n_aux > 0)
+    if expert_active:
+        print(f"  Experts: {n_sw} short-win + {n_aux} aux (blend 20%+10%)")
 
     # ── 最终分数 ──
     if nn_scores is not None:
         scores = nn_scores
-        if aux_loaded > 0:
-            def _n(s): return (s - s.min()) / (s.max() - s.min() + 1e-9)
-            scores = 0.75 * scores + 0.25 * _n(aux_scores)
+        if expert_active:
+            scores = 0.70 * scores + expert_blend
     elif is_lgbm:
         scores = np.array([lgbm_scores.get(s, -999) for s in stock_ids])
-        if aux_loaded > 0:
-            def _n(s): return (s - s.min()) / (s.max() - s.min() + 1e-9)
-            scores = 0.75 * _n(scores) + 0.25 * _n(aux_scores)
+        if expert_active:
+            scores = 0.70 * _n(scores) + expert_blend
     else:
         print("[ERROR] No scores"); return
 
