@@ -52,9 +52,9 @@ def calculate_predict_weight_score(output_data, test_data):
 if __name__ == "__main__":
     # 使用扩展 Panel 的最后5个交易日作为测试数据
     try:
-        from data_loader import get_official_stock_ids, build_panel_from_official
-        stock_ids = get_official_stock_ids()
-        panel = build_panel_from_official(stock_ids)
+        from tushare_loader import fetch_csi300_stocks, build_tushare_only_panel
+        stock_ids = fetch_csi300_stocks()
+        panel = build_tushare_only_panel(stock_ids)
         df = panel.reset_index()[['date', 'stock_id', 'open']]
         # 取最后5个交易日
         last_dates = sorted(df['date'].unique())[-5:]

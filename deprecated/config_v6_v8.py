@@ -22,18 +22,7 @@
 """
 
 from pathlib import Path
-import os
 import torch
-
-# NN 设备（LGBM 不用）
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-# =============================================================================
-# Tushare API 配置
-# =============================================================================
-
-TUSHARE_TOKEN = os.environ.get("TUSHARE_TOKEN", "c517f0f062c5202be84c818bf38afc6372970aaa240cff5aa1df5923")
-TUSHARE_CACHE_DIR = None  # 由 tushare_loader 自动设为 RAW_DIR / "tushare"
 
 
 # =============================================================================
@@ -77,10 +66,13 @@ OUTPUT_DIR = SUBMISSION_PATH.parent
 #   - 2025-2026: 慢牛行情、DeepSeek/AI 主题、关税冲击
 START_DATE = "2021-06-01"       # 预留 ~7 个月给特征计算的 warm-up
 EFFECTIVE_START = "2022-01-01"  # 实际训练样本从这个日期开始
-END_DATE = "2026-06-12"         # 最新数据
+END_DATE = "2026-05-30"         # 最新数据
 
-# 回溯窗口：每个样本用过去 20 个交易日（约 1 个月）的数据作为输入
-LOOKBACK_DAYS = 20  # 降噪+省显存
+# 回溯窗口：每个样本用过去 60 个交易日（约 3 个月）的数据作为输入
+# 这个窗口长度需要在"足够信息"和"响应速度"之间平衡：
+#   - 太短：噪音大，缺少统计规律
+#   - 太长：包含过时信息，模型响应变慢
+LOOKBACK_DAYS = 60
 
 # 预测周期：4 个交易日（T+1 开盘价 → T+5 开盘价）
 # 赛题定义的收益周期
@@ -199,9 +191,68 @@ BETA_WINDOW = 60
 
 
 # =============================================================================
-# 四、NN 模型参数 — 全部废弃 (V9+), 保留仅用于 train.py / model.py 兼容
+# 四、模型结构参数
 # =============================================================================
-# (NN 不再用于生产，详见 deprecated/)
+
+# 隐藏层维度：所有中间表示的维度
+# 128 基础版 / 256 高性能版（RTX 3080 20GB 可跑 256）
+D_MODEL = 128
+
+# 注意力头数：将 d_model 分成多个低维子空间并行计算
+N_HEADS = 8
+
+# GRU 层数：堆叠 2~3 层以捕捉更复杂的时序模式
+N_GRU_LAYERS = 2
+
+# Dropout 比例：训练时随机丢弃 10% 的神经元，防止过拟合
+DROPOUT = 0.1
+
+# 时序注意力（Bahdanau，可选）
+USE_ATTENTION = False  # 已集成，需重训全量模型才能生效
+USE_MARKET_GATE = False  # 市场门控（借鉴 AAAI 2024 MASTER），需重训才能生效
+USE_GAT = False  # 图注意力网络 GAT 替代 Transformer，需重训
+
+# 截面 Transformer 层数：在股票维度做几层自注意力
+# 2 层基础 / 4 层高性能
+N_TRANSFORMER_LAYERS = 2
+
+# Transformer 中前馈网络的维度：通常是 d_model 的 2~4 倍
+D_FF = 256
+
+# 高性能模式配置（通过 --big-model 启用）
+BIG_D_MODEL = 256
+BIG_N_HEADS = 8
+BIG_N_GRU_LAYERS = 3
+BIG_N_TRANSFORMER_LAYERS = 4
+BIG_D_FF = 512
+
+
+# =============================================================================
+# 五、训练参数
+# =============================================================================
+
+BATCH_SIZE = 64               # 批次大小（RTX 3080 20GB 可跑 128）
+N_EPOCHS = 300              # 最大训练轮数
+LR = 1e-4                   # 初始学习率（使用 OneCycleLR，初始高）
+LR_PEAK = 3e-4              # OneCycleLR 峰值学习率
+WEIGHT_DECAY = 1e-5         # L2 正则化系数
+GRAD_CLIP = 1.0             # 梯度裁剪阈值（防止梯度爆炸）
+
+# ReduceLROnPlateau 的 patience：连续 N 个 epoch 验证损失不降则学习率减半
+LR_PATIENCE = 15
+
+# Early Stopping patience：连续 N 个 epoch 验证损失不降则停止训练
+EARLY_STOP_PATIENCE = 50
+
+# DataLoader 工作线程数（0 = 主进程加载，503GB 内存可开满 12 核）
+N_WORKERS = 8
+
+# 训练/验证/测试的按时间顺序切分比例
+VAL_RATIO = 0.15            # 15% 验证集
+TEST_RATIO = 0.1            # 10% 测试集
+
+# 排序损失的 margin：Hinge loss 中正负 pair 的最小分差
+RANKING_MARGIN = 0.05
 
 
 # =============================================================================
@@ -220,28 +271,9 @@ TOP_K_CANDIDATES = 30
 TEMPERATURE = 0.5
 
 
-
 # =============================================================================
-# 八、LGBM 训练参数（Purged K-Fold, V9.1 baseline）
+# 七、设备选择
 # =============================================================================
 
-LGBM_GAP = 5                       # Purge buffer
-LGBM_VAL_N = 60                    # 验证窗口(天)
-LGBM_PURGE_DAYS = 2                # 折间 purge
-LGBM_PURGE_WINDOW = 200            # Purged K-Fold 回看窗口
-LGBM_N_FOLDS = 4                   # 折数
-LGBM_MIN_TREES = 250               # 保底树数
-LGBM_BLIND_TREES_FALLBACK = 400    # 盲跑回退树数
-
-# LGBM Hubert 生产参数（旧值，V9.1 基线）
-LGBM_ALPHA = 1.2
-LGBM_LEAVES = 68
-LGBM_LR = 0.0196
-LGBM_MAX_DEPTH = 6
-LGBM_MIN_CHILD = 42
-LGBM_REG_LAMBDA = 0.0022
-LGBM_REG_ALPHA = 0.0054
-LGBM_SUBSAMPLE = 0.738
-LGBM_COLSAMPLE = 0.939
-LGBM_TIME_DECAY_HALF = 120
-
+# 自动选择 GPU 或 CPU
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"

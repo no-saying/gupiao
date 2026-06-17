@@ -22,11 +22,8 @@
 """
 
 from pathlib import Path
-import os
 import torch
-
-# NN 设备（LGBM 不用）
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+import os
 
 # =============================================================================
 # Tushare API 配置
@@ -199,9 +196,68 @@ BETA_WINDOW = 60
 
 
 # =============================================================================
-# 四、NN 模型参数 — 全部废弃 (V9+), 保留仅用于 train.py / model.py 兼容
+# 四、模型结构参数
 # =============================================================================
-# (NN 不再用于生产，详见 deprecated/)
+
+# 隐藏层维度：所有中间表示的维度
+# 128 基础版 / 256 高性能版（RTX 3080 20GB 可跑 256）
+D_MODEL = 128
+
+# 注意力头数：将 d_model 分成多个低维子空间并行计算
+N_HEADS = 8
+
+# GRU 层数：堆叠 2~3 层以捕捉更复杂的时序模式
+N_GRU_LAYERS = 2
+
+# Dropout 比例：训练时随机丢弃 10% 的神经元，防止过拟合
+DROPOUT = 0.1
+
+# 时序注意力（Bahdanau，可选）
+USE_ATTENTION = False  # 已集成，需重训全量模型才能生效
+USE_MARKET_GATE = False  # 市场门控（借鉴 AAAI 2024 MASTER），需重训才能生效
+USE_GAT = False  # 图注意力网络 GAT 替代 Transformer，需重训
+
+# 截面 Transformer 层数：在股票维度做几层自注意力
+# 2 层基础 / 4 层高性能
+N_TRANSFORMER_LAYERS = 2
+
+# Transformer 中前馈网络的维度：通常是 d_model 的 2~4 倍
+D_FF = 256
+
+# 高性能模式配置（通过 --big-model 启用）
+BIG_D_MODEL = 256
+BIG_N_HEADS = 8
+BIG_N_GRU_LAYERS = 3
+BIG_N_TRANSFORMER_LAYERS = 4
+BIG_D_FF = 512
+
+
+# =============================================================================
+# 五、训练参数
+# =============================================================================
+
+BATCH_SIZE = 64               # 批次大小（RTX 3080 20GB 可跑 128）
+N_EPOCHS = 300              # 最大训练轮数
+LR = 1e-4                   # 初始学习率（使用 OneCycleLR，初始高）
+LR_PEAK = 3e-4              # OneCycleLR 峰值学习率
+WEIGHT_DECAY = 1e-5         # L2 正则化系数
+GRAD_CLIP = 1.0             # 梯度裁剪阈值（防止梯度爆炸）
+
+# ReduceLROnPlateau 的 patience：连续 N 个 epoch 验证损失不降则学习率减半
+LR_PATIENCE = 15
+
+# Early Stopping patience：连续 N 个 epoch 验证损失不降则停止训练
+EARLY_STOP_PATIENCE = 50
+
+# DataLoader 工作线程数（0 = 主进程加载，503GB 内存可开满 12 核）
+N_WORKERS = 8
+
+# 训练/验证/测试的按时间顺序切分比例
+VAL_RATIO = 0.15            # 15% 验证集
+TEST_RATIO = 0.1            # 10% 测试集
+
+# 排序损失的 margin：Hinge loss 中正负 pair 的最小分差
+RANKING_MARGIN = 0.05
 
 
 # =============================================================================
@@ -219,6 +275,13 @@ TOP_K_CANDIDATES = 30
 # 0.5 = 适中的集中度，让模型判断有信心时权重更高
 TEMPERATURE = 0.5
 
+
+# =============================================================================
+# 七、设备选择
+# =============================================================================
+
+# 自动选择 GPU 或 CPU
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # =============================================================================
@@ -245,3 +308,11 @@ LGBM_SUBSAMPLE = 0.738
 LGBM_COLSAMPLE = 0.939
 LGBM_TIME_DECAY_HALF = 120
 
+# XGBoost 参数
+XGB_N_ESTIMATORS = 500
+XGB_MAX_DEPTH = 6
+XGB_LR = 0.02
+XGB_SUBSAMPLE = 0.75
+XGB_COLSAMPLE = 0.7
+XGB_REG_LAMBDA = 2.0
+XGB_REG_ALPHA = 0.5

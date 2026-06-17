@@ -8,17 +8,18 @@ __pycache__/
 .DS_Store
 .data/
 data/
+data
 models/
+models
 output/
 temp/
 result.csv
 .ipynb_checkpoints/
 
-# 临时评分文件
+# 训练日志/临时文件
 tmp_score.csv
-
-# 训练日志
 train_*.log
+catboost_info/
 
 # 备份目录
 models_backup_*/

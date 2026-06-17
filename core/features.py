@@ -33,20 +33,9 @@ from config import (
     RSI_PERIOD, MACD_FAST, MACD_SLOW, MACD_SIGNAL, BETA_WINDOW,
     EXTRA_INDEX_RET_WINDOWS, EFFECTIVE_START, RAW_DIR,
 )
-from data_loader import fetch_index_data, build_event_mask, fetch_stock_industries, fetch_fundamental_data
-from sklearn.linear_model import LinearRegression
+from tushare_loader import fetch_index_daily
 
 # 特征标准化参数（由 make_window_samples 设置，供 train.py/predict.py 加载）
-_NORM_STATS = None  # (feat_mean, feat_std)
-
-def get_norm_stats():
-    """返回特征标准化参数 (feat_mean, feat_std)。"""
-    return _NORM_STATS
-
-
-# =============================================================================
-# 单只股票的因子计算
-# =============================================================================
 
 def _per_stock(group: pd.DataFrame) -> pd.DataFrame:
     """
@@ -208,24 +197,24 @@ def add_market_index_features(panel: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def add_extra_index_features(panel: pd.DataFrame) -> pd.DataFrame:
-    """合并上证50、中证500、创业板指、上证综指的特征。"""
-    index_panel = fetch_index_data()
-    if index_panel.empty:
+    """合并上证50、中证500、创业板指、上证综指的收益率特征（tushare 数据源）。"""
+    idx_df = fetch_index_daily()
+    if idx_df.empty:
         return panel
-    index_names = index_panel.index.get_level_values("index_name").unique()
+
+    # tushare returns flat df with 'name' column for index names
     result = panel.copy()
-    for idx_name in index_names:
-        idx_data = index_panel.xs(idx_name, level="index_name").copy()
-        idx_data = idx_data.sort_index()
+    for idx_name in idx_df['index_name'].unique():
+        idx_data = idx_df[idx_df['index_name'] == idx_name].copy()
+        idx_data = idx_data.sort_values('date').set_index('date')
         for w in EXTRA_INDEX_RET_WINDOWS:
             col_name = f"{idx_name}_ret_{w}d"
-            idx_data[col_name] = idx_data["close"].pct_change(w)
-            idx_data[col_name] = idx_data[col_name].replace([np.inf, -np.inf], np.nan)
-            date_series = idx_data[col_name]
-            result[col_name] = result.groupby("date").apply(
-                lambda g: pd.Series(date_series.get(g.name, np.nan), index=g.index)
+            ret_series = idx_data['close'].pct_change(w).replace([np.inf, -np.inf], np.nan)
+            result[col_name] = result.groupby('date').apply(
+                lambda g: pd.Series(ret_series.get(g.name, np.nan), index=g.index)
             ).droplevel(0)
-    print(f"[features] Added {len(index_names)} extra indices, "
+
+    print(f"[features] Added {len(idx_df['index_name'].unique())} extra indices, "
           f"{len(EXTRA_INDEX_RET_WINDOWS)} windows each")
     return result
 
@@ -405,10 +394,22 @@ def add_calendar_features(panel: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def add_industry_features(panel: pd.DataFrame, stock_ids: list[str]) -> pd.DataFrame:
-    """计算行业平均收益率和个股 Alpha。"""
-    industries = fetch_stock_industries(stock_ids)
-    stock_id_level = panel.index.get_level_values("stock_id")
-    panel["industry"] = stock_id_level.map(industries).fillna("Unknown")
+    """计算行业平均收益率和个股 Alpha（优先使用 panel 中已有的 SW 行业列）。"""
+    # tushare panel 已有 l2_name 列，直接使用
+    if 'l2_name' in panel.columns:
+        panel['industry'] = panel['l2_name']
+    else:
+        # fallback: 用 tushare_loader 获取
+        from tushare_loader import fetch_sw_industry
+        industries = fetch_sw_industry()
+        # fetch_sw_industry returns DataFrame with ts_code, l1_name, l2_name, l3_name
+        if not industries.empty:
+            ind_map = industries.set_index('ts_code')['l2_name'].to_dict()
+            panel['industry'] = panel.index.get_level_values('stock_id').map(
+                lambda x: ind_map.get(x, 'Unknown')).fillna('Unknown')
+        else:
+            panel['industry'] = 'Unknown'
+
     for w in [5, 20]:
         col = f"ret_{w}d"
         if col not in panel.columns:
@@ -419,7 +420,6 @@ def add_industry_features(panel: pd.DataFrame, stock_ids: list[str]) -> pd.DataF
     if "vol_5d" in panel.columns:
         panel["ind_vol_5d"] = panel.groupby(["date", "industry"])["vol_5d"].transform("mean")
     panel["industry_size"] = panel.groupby(["date", "industry"])["industry"].transform("count")
-    # 行业内收益百分位排名
     if "pctChg" in panel.columns:
         panel["industry_rank_return"] = panel.groupby(["date", "industry"])["pctChg"].rank(pct=True)
     return panel
@@ -431,128 +431,6 @@ def add_industry_features(panel: pd.DataFrame, stock_ids: list[str]) -> pd.DataF
 
 # =============================================================================
 # 基本面因子（季度财报数据）
-# =============================================================================
-
-def add_fundamental_features(panel: pd.DataFrame, stock_ids: list[str]) -> pd.DataFrame:
-    """
-    合并季度财报数据到日线 Panel。
-
-    实现：
-      1. 下载所有股票的季度财报
-      2. 以财报发布日期为准，向前填充到每个交易日
-      3. 新增因子：ROE、毛利率、净利润率、EPS、资产负债率、利润增速等
-    """
-    fundamental = fetch_fundamental_data(stock_ids)
-    if fundamental.empty:
-        print("[features] WARNING: No fundamental data available")
-        return panel
-
-    result = panel.reset_index()
-    result = result.sort_values(["stock_id", "date"])
-
-    # 按 stock_id 合并：对每个股票，用财报发布日期向前填充
-    fund_cols = ["roe_ttm", "np_margin", "gp_margin", "eps_ttm",
-                 "current_ratio", "debt_to_asset", "profit_yoy",
-                 "equity_yoy"]
-
-    result = result.merge(
-        fundamental, on=["stock_id", "date"], how="left"
-    )
-
-    # 向前填充（每个股票独立，填充到下一个财报发布前）
-    for col in fund_cols:
-        if col in result.columns:
-            result[col] = result.groupby("stock_id")[col].transform(
-                lambda s: s.ffill()
-            )
-
-    # 填充缺失值
-    for col in fund_cols:
-        if col in result.columns:
-            result[col] = result[col].fillna(0).replace([np.inf, -np.inf], 0)
-
-    result = result.set_index(["date", "stock_id"])
-    panel = result[panel.columns.tolist() + [c for c in fund_cols if c in result.columns]]
-    return panel
-
-
-# =============================================================================
-# 行业中性化：对每个截面因子做行业+市值回归取残差
-# =============================================================================
-
-def neutralize_features(panel: pd.DataFrame) -> pd.DataFrame:
-    """
-    对因子做行业中性化：每个交易日，对每个数值因子做行业哑变量回归，取残差。
-
-    为什么？
-      很多因子（如动量、波动率）在不同行业分布不均匀。
-      如果某段时间银行股集体上涨，动量因子会偏向银行股。
-      行业中性化去掉行业共同部分，保留个股特异信号。
-
-    实现：
-      对每个交易日，每个数值因子：
-        factor = β₀ + Σβᵢ·industry_ⱼ + ε
-      返回 ε 作为中性化后的因子值。
-    """
-    df = panel.reset_index()
-    dates = df["date"].unique()
-
-    # 识别数值因子列（排除索引、行业标签和原始价格列）
-    EXCLUDE = {"open", "high", "low", "close", "preclose", "volume",
-               "amount", "turn", "pctChg", "amplitude", "change",
-               "stock_id", "date", "index_name", "industry",
-               "vol_ma5", "vol_ma20", "turn_ma5", "turn_ma20"}
-    feat_cols = [c for c in df.columns if c not in EXCLUDE and c not in ("date", "stock_id", "industry")]
-
-    # 确保 industry 列存在
-    if "industry" not in df.columns:
-        print("[features] No industry data for neutralization")
-        return panel
-
-    print(f"[features] Neutralizing {len(feat_cols)} features across {len(dates)} dates ...")
-
-    df_neut = df.copy()
-    for d in dates:
-        mask = df_neut["date"] == d
-        sub = df_neut.loc[mask]
-        if len(sub) < 10:
-            continue
-
-        # 行业哑变量
-        industries = sub["industry"].values
-        unique_ind = list(set(industries))
-        if len(unique_ind) < 2:
-            continue
-
-        # 手动构造 one-hot（避免 sklearn 的 sparse）
-        ind_dummies = np.zeros((len(sub), len(unique_ind)))
-        for j, ind in enumerate(unique_ind):
-            ind_dummies[:, j] = (industries == ind).astype(float)
-
-        # 去掉第一列（防止多重共线性）
-        ind_dummies = ind_dummies[:, 1:]
-
-        for col in feat_cols:
-            if col not in sub.columns:
-                continue
-            y = sub[col].values
-            valid = ~np.isnan(y) & ~np.isnan(y) & (np.abs(y) < 1e8)
-            if valid.sum() < len(unique_ind) + 5:
-                continue
-            try:
-                lr = LinearRegression()
-                lr.fit(ind_dummies[valid], y[valid])
-                residual = y - lr.predict(ind_dummies)
-                df_neut.loc[mask, col] = residual
-            except Exception:
-                continue
-
-    panel_neut = df_neut.set_index(["date", "stock_id"])
-    # 保留 industry 列
-    panel_neut = panel_neut[panel.columns.tolist()]
-    print(f"[features] Neutralization done")
-    return panel_neut
-
 
 def engineer_features(panel: pd.DataFrame, stock_ids: list[str] | None = None) -> pd.DataFrame:
     """完整特征工程流水线（结果缓存到 raw/features_panel.parquet）。"""
@@ -598,141 +476,3 @@ def engineer_features(panel: pd.DataFrame, stock_ids: list[str] | None = None) -
 
     print(f"[features] Done. Panel shape: {panel.shape}, columns: {len(panel.columns)}")
     return panel
-
-
-# =============================================================================
-# 向量化预计算
-# =============================================================================
-
-def _precompute_stock_arrays(panel, stock_ids, feature_cols, dates):
-    """
-    全向量化预计算：将 MultiIndex Panel 转换为 3D numpy 数组。
-    无 Python 逐行循环，单次 numpy advanced indexing 填充。
-    """
-    n_stocks = len(stock_ids)
-    n_dates = len(dates)
-    n_features = len(feature_cols)
-
-    stock_to_idx = {s: i for i, s in enumerate(stock_ids)}
-    date_to_idx  = {d: i for i, d in enumerate(dates)}
-
-    df = panel.reset_index()[["date", "stock_id", "open"] + feature_cols]
-    df["stock_idx"] = df["stock_id"].map(stock_to_idx).astype(np.int32)
-    df["date_idx"]  = df["date"].map(date_to_idx).astype(np.int32)
-    df = df.dropna(subset=["stock_idx", "date_idx"])
-
-    s_idx = df["stock_idx"].values
-    d_idx = df["date_idx"].values
-
-    feats_arr = np.zeros((n_stocks, n_dates, n_features), dtype=np.float32)
-    open_arr  = np.zeros((n_stocks, n_dates), dtype=np.float32)
-    has_data  = np.zeros((n_stocks, n_dates), dtype=bool)
-
-    feats_arr[s_idx, d_idx] = df[feature_cols].values.astype(np.float32)
-    open_arr[s_idx, d_idx]  = df["open"].values.astype(np.float32)
-    has_data[s_idx, d_idx]  = True
-
-    np.nan_to_num(feats_arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
-    np.nan_to_num(open_arr, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
-
-    return feats_arr, open_arr, has_data
-
-
-# =============================================================================
-# 窗口采样（向量化加速版）
-# =============================================================================
-
-def make_window_samples(
-    panel: pd.DataFrame,
-    stock_ids: list[str],
-    lookback: int = LOOKBACK_DAYS,
-    horizon: int = PREDICT_HORIZON,
-    step: int = STEP_DAYS,
-    normalize: bool = True,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    """
-    向量化窗口采样：将 Panel 切分为 (输入窗口, 未来收益) 样本对。
-    """
-    global _NORM_STATS
-
-    dates = sorted(panel.index.get_level_values("date").unique())
-    n_stocks = len(stock_ids)
-    n_dates = len(dates)
-
-    from features_alpha158 import ALPHA158_NEW_COLS
-    EXCLUDE_COLS = {"open", "high", "low", "close", "preclose", "volume",
-                    "amount", "adjustflag", "turn", "tradestatus",
-                    "pctChg", "peTTM", "pbMRQ", "market_ret",
-                    "stock_id", "index_name", "vol_ma5", "vol_ma20",
-                    "turn_ma5", "turn_ma20", "industry",
-                    "amplitude", "change",
-                    "roe_ttm", "np_margin", "gp_margin", "eps_ttm",
-                    "current_ratio", "debt_to_asset", "profit_yoy", "equity_yoy",
-                    "nn_score",
-                    *ALPHA158_NEW_COLS}
-    feature_cols = [c for c in panel.columns if c not in EXCLUDE_COLS]
-    n_features = len(feature_cols)
-
-    # 预计算 3D 数组
-    feats_arr, open_arr, has_data = _precompute_stock_arrays(
-        panel, stock_ids, feature_cols, dates,
-    )
-
-    X_list, y_list, mask_list, date_labels = [], [], [], []
-
-    for idx in range(lookback + horizon, n_dates, step):
-        target_end_date = dates[idx]
-        if target_end_date < pd.Timestamp(EFFECTIVE_START):
-            continue
-
-        hist_start = idx - horizon - lookback + 1
-        hist_end   = idx - horizon + 1
-        X = feats_arr[:, hist_start:hist_end, :].copy()
-        if X.shape[1] < lookback:
-            pad_w = lookback - X.shape[1]
-            X = np.pad(X, ((0, 0), (pad_w, 0), (0, 0)), mode="constant")
-
-        open_t1 = open_arr[:, idx - horizon + 1]
-        open_t5 = open_arr[:, idx]
-        valid_open = open_t1 > 1e-8
-        y = np.divide(open_t5 - open_t1, open_t1, out=np.zeros_like(open_t1), where=valid_open)
-
-        hist_ok = has_data[:, hist_start:hist_end].sum(axis=1) >= lookback * 0.7
-        target_ok = valid_open & (open_t5 > 1e-8)
-        mask = (hist_ok & target_ok).astype(np.float32)
-
-        if mask.sum() < 5:
-            continue
-
-        X_list.append(X)
-        y_list.append(y)
-        mask_list.append(mask)
-        date_labels.append(str(target_end_date.date()))
-
-    X_arr = np.array(X_list)
-    y_arr = np.array(y_list)
-    m_arr = np.array(mask_list)
-
-    # 事件过滤
-    date_timestamps = [pd.Timestamp(d) for d in date_labels]
-    event_mask = build_event_mask(date_timestamps)
-    X_arr = X_arr[event_mask]
-    y_arr = y_arr[event_mask]
-    m_arr = m_arr[event_mask]
-    date_labels = [d for d, keep in zip(date_labels, event_mask) if keep]
-
-    # z-score 标准化
-    if normalize:
-        feat_mean = X_arr.mean(axis=(0, 1, 2), keepdims=True)
-        feat_std  = X_arr.std(axis=(0, 1, 2), keepdims=True)
-        feat_std  = np.where(feat_std < 1e-8, 1.0, feat_std)
-        X_arr = (X_arr - feat_mean) / feat_std
-        _NORM_STATS = (feat_mean, feat_std)
-
-        X_valid = X_arr[m_arr > 0.5]
-        print(f"[features] Normalized: mean={X_valid.mean():.4f}, std={X_valid.std():.4f}")
-
-    print(f"[features] Built {len(X_arr)} samples: "
-          f"X={X_arr.shape}, features={n_features}, "
-          f"valid stocks/sample ≈ {m_arr.mean(axis=1).mean():.0f}")
-    return X_arr, y_arr, m_arr, date_labels
