@@ -1,11 +1,23 @@
-"""DANN 模型回测 — 12 周 walk-forward"""
-import sys, torch, numpy as np, pandas as pd, time
+"""DANN 模型回测 — 12 周 walk-forward
+
+Usage:
+  python backtest_dann.py                         # dann_mse.pt (默认)
+  python backtest_dann.py --model dann_margin.pt   # Margin Ranking Loss 模型
+  python backtest_dann.py --model dann_mse.pt      # MSE 模型
+"""
+import argparse, sys, torch, numpy as np, pandas as pd, time
 sys.path.insert(0, '.')
 from config import MODEL_DIR, DEVICE
 from core.dann_model import DANNStockModel
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", type=str, default="dann_mse.pt",
+                    help="Model file in models/")
+args = parser.parse_args()
+
 device = torch.device(DEVICE)
 torch.cuda.empty_cache()
+print(f"Model: {args.model}")
 
 # ── 1. 加载数据 ──
 from tushare_loader import TUSHARE_DIR, fetch_csi300_stocks, fetch_csi500_stocks
@@ -41,7 +53,7 @@ print(f"Windows: {n_stocks}s × {n_windows}w")
 
 # ── 3. 加载 DANN 模型 ──
 model = DANNStockModel(F, d_model=256, n_stocks=n_stocks, lambda_domain=0.5).to(device)
-model.load_state_dict(torch.load(MODEL_DIR / "dann_model.pt", map_location=device))
+model.load_state_dict(torch.load(MODEL_DIR / args.model, map_location=device))
 model.eval()
 print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} params")
 

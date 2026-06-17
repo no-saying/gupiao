@@ -99,9 +99,98 @@ class DANNStockModel(nn.Module):
         return scores, domain_logits
 
 
+def margin_ranking_loss(scores: torch.Tensor, targets: torch.Tensor,
+                        margin: float = 0.02, alpha_mse: float = 1.0) -> torch.Tensor:
+    """Margin ranking loss + MSE 锚定 — 防止分数坍缩。
+
+    对于每对 (i,j) 其中 y_i > y_j：
+        loss = max(0, margin - (s_i - s_j))
+
+    纯 margin loss 会导致所有分数坍缩到同一值（模型学出常数输出）。
+    加入 alpha_mse * MSE(scores, targets) 锚定绝对尺度。
+
+    Args:
+        scores: (B, N) 预测分数
+        targets: (B, N) 真实收益
+        margin: 最小间隔阈值
+        alpha_mse: MSE 正则化强度
+
+    Returns:
+        scalar loss
+    """
+    B, N = scores.shape
+
+    # 成对差异矩阵: (B, N, N)
+    target_diff = targets.unsqueeze(2) - targets.unsqueeze(1)
+    score_diff = scores.unsqueeze(2) - scores.unsqueeze(1)
+
+    # 只惩罚 target_diff > 0 的对（i 比 j 好但分数不够高）
+    mask = (target_diff > 0).float()
+
+    # Hinge: max(0, margin - score_diff)
+    pair_losses = F.relu(margin - score_diff)
+
+    n_pairs = mask.sum() + 1e-8
+    ranking_loss = (pair_losses * mask).sum() / n_pairs
+
+    # MSE 锚定：防止分数坍缩
+    mse_loss = F.mse_loss(scores, targets)
+
+    return ranking_loss + alpha_mse * mse_loss
+
+
+def lambdarank_loss(scores: torch.Tensor, targets: torch.Tensor,
+                    k: int = 5, sigma: float = 1.0,
+                    alpha_mse: float = 0.5) -> torch.Tensor:
+    """LambdaRank 损失 + MSE 锚定 — 优化 NDCG@K 同时防止分数坍缩。
+
+    LambdaRank 梯度：
+        λ_ij = |ΔNDCG_ij| * σ / (1 + exp(σ * (s_i - s_j)))
+
+    Loss = LambdaRank_loss + alpha_mse * MSE(scores, targets)
+
+    Args:
+        scores: (B, N) 预测分数
+        targets: (B, N) 真实收益
+        k: NDCG@K 截断
+        sigma: sigmoid 温度
+        alpha_mse: MSE 正则化强度
+
+    Returns:
+        scalar loss
+    """
+    B, N = scores.shape
+    relevance = targets
+
+    # 成对差异
+    score_diff = scores.unsqueeze(2) - scores.unsqueeze(1)  # (B, N, N)
+    target_diff = relevance.unsqueeze(2) - relevance.unsqueeze(1)
+    valid_pairs = (target_diff > 0).float()
+
+    # |ΔNDCG| 近似：用排名位置的对数折扣差异
+    rank_i = torch.argsort(torch.argsort(scores, dim=1, descending=True), dim=1).float()
+    discount_i = 1.0 / torch.log2(rank_i + 2.0)
+    delta_ndcg = torch.abs(discount_i.unsqueeze(2) - discount_i.unsqueeze(1))
+
+    # LambdaRank 梯度: λ_ij = |ΔNDCG_ij| * σ / (1 + exp(σ * (s_i - s_j)))
+    lambda_ij = delta_ndcg * sigma / (1.0 + torch.exp(sigma * score_diff))
+
+    # Pairwise logistic loss weighted by lambda
+    pairwise_logloss = torch.log(1.0 + torch.exp(sigma * (-score_diff)))
+    weighted_loss = lambda_ij * pairwise_logloss * valid_pairs
+    total_lambda = (lambda_ij * valid_pairs).sum() + 1e-8
+    ranking_loss = weighted_loss.sum() / total_lambda
+
+    # MSE 锚定
+    mse_loss = F.mse_loss(scores, targets)
+
+    return ranking_loss + alpha_mse * mse_loss
+
+
 def dann_loss(task_scores: torch.Tensor, task_targets: torch.Tensor,
               domain_logits: torch.Tensor, domain_labels: torch.Tensor,
-              lambda_domain: float = 1.0) -> dict:
+              lambda_domain: float = 1.0,
+              task_loss_type: str = "mse") -> dict:
     """DANN 组合损失。
 
     Args:
@@ -109,18 +198,25 @@ def dann_loss(task_scores: torch.Tensor, task_targets: torch.Tensor,
         task_targets: (B, N) — 真实收益
         domain_logits: (B*N,) — 域分类 logits
         domain_labels: (B*N,) — 域标签 (0=300, 1=500)
+        lambda_domain: 域损失权重
+        task_loss_type: "mse" | "margin" | "lambdarank"
 
     Returns:
         dict with total_loss, task_loss, domain_loss
     """
-    # 任务损失：MSE on returns
-    task_loss = F.mse_loss(task_scores, task_targets)
+    # 任务损失
+    if task_loss_type == "margin":
+        task_loss = margin_ranking_loss(task_scores, task_targets)
+    elif task_loss_type == "lambdarank":
+        task_loss = lambdarank_loss(task_scores, task_targets, k=5)
+    else:
+        task_loss = F.mse_loss(task_scores, task_targets)
 
     # 域损失：二分类 BCE（希望分不清 → 越大越好 → 对抗训练）
     domain_loss = F.binary_cross_entropy_with_logits(
         domain_logits, domain_labels.float())
 
-    # 总损失 = 任务 - lambda * 域（梯度反转已在层中处理）
+    # 总损失 = 任务 + lambda * 域（梯度反转已在层中处理）
     total_loss = task_loss + lambda_domain * domain_loss
 
     return {

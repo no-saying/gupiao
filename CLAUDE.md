@@ -18,8 +18,11 @@ python train_nn.py --pretrain --epochs 200 # MAE 预训练
 python train_nn.py --finetune --epochs 100 # CVXPY 微调
 
 # DANN 域自适应（886 只股票 → 只在 CSI300 选股）
-python train_dann.py
-python backtest_dann.py       # DANN 回测验证
+python train_dann.py                        # MSE 损失 (默认, 最优)
+python train_dann.py --loss margin          # Margin Ranking (实验性)
+python train_dann.py --loss lambdarank      # LambdaRank (实验性)
+python backtest_dann.py                     # 回测 dann_mse.pt
+python backtest_dann.py --model dann_margin.pt
 
 # 特征工程 — 删除缓存强制重算
 rm data/raw/alpha158_panel.parquet && python controller.py
@@ -82,7 +85,7 @@ gupiao/
 │   ├── validate.py        # LGBM walk-forward
 │   ├── nn_model.py        # Mamba/GAT/MAE 架构
 │   ├── cvxpy_layer.py     # 可微组合层
-│   └── dann_model.py      # DANN 域自适应模型
+│   └── dann_model.py      # DANN + 多损失 (MSE/Margin/LambdaRank)
 ├── train_dann.py          # DANN 训练入口（886只→300只）
 ├── backtest_dann.py       # DANN walk-forward 回测
 └── deprecated/            # V6~V10 废弃代码
@@ -108,6 +111,9 @@ gupiao/
 | 10 | **sliding_window_view 维度翻转** — 5x 显存爆炸 |
 | 11 | **CUDA 版本不匹配** — PyTorch 13.0 vs 驱动 12.4，需装 cu124 版 |
 | 12 | **MAE+GAT 打不过 LGBM** — 200 epoch 预训练 + 100 epoch 微调 = 50% 胜率平手 |
+| 13 | **Pairwise 排名损失导致分数坍缩** — Margin Ranking + alpha_mse=0.1→std 0.008, Sharpe 1.26 |
+| 14 | **LambdaRank 不适合神经网络** — 梯度结构为 GBDT 设计，NN 上 Sharpe 仅 0.60 |
+| 15 | **MSE 仍是最好选择** — DANN 的域自适应已做主要贡献，损失函数改变无增量 |
 
 ### SCORE 演进史
 
@@ -125,6 +131,8 @@ gupiao/
 | **06-17** | **LGBM 重构+alpha158Numba** | 0.0643 | **+0.0242(4周)** | **4.25** | **75%** | 🟢 信号显著增强 |
 | **06-17** | **🏆 DANN 域自适应** | — | **+0.0329** | **4.54** | **75%** | 🟢🏆 **当前最优**：886训练→300选股 |
 | **06-17** | **LGBM (alpha158新缓存)** | — | **+0.0140** | **3.84** | **58%** | 🟢 配新缓存后提升明显 |
+| 06-17 | DANN+Margin+MSE | — | +0.0046 | 1.26 | 50% | ❌ 分数坍缩 std=0.008 |
+| 06-17 | DANN+LambdaRank+MSE | — | +0.0025 | 0.60 | 58% | ❌ LambdaRank 不适合 NN |
 
 > *逐日回测（窗口重叠）虚高，按周才是真实水平。
 
@@ -151,14 +159,15 @@ gupiao/
 | 3 | **知识蒸馏** | 886 只上的 Teacher → Soft Labels → 300 只上的 Student | 待实现 |
 | 4 | **宏观门控** | 用 886 只数据合成市场宽度/风格强弱，HMM 切换攻防 | 待实现 |
 
-### 当前状态 (2026-06-17 15:00)
+### 当前状态 (2026-06-17 19:00)
 
 - ✅ 代码重构完成 — 旧文件移入 `deprecated/`
 - ✅ `core/ultimate_ols.py` — Numba 12核引擎 (886×1220 < 72s)
 - ✅ `core/alpha158.py` — 已重写 + 缓存重生成功
-- ✅ DANN 模型训练完成 + 回测验证 (`models/dann_model.pt`)
-- ✅ **DANN Sharpe 4.54, WinRate 75% — 当前最优模型**
-- ✅ LGBM 基线更新 (Sharpe 3.84, 配新缓存)
+- ✅ **DANN+MSE Sharpe 4.54, WinRate 75% — 当前最优模型**
+- ✅ LGBM 基线更新 (Sharpe 3.84)
+- ❌ 排名损失实验失败 — Margin(Sharpe 1.26) / LambdaRank(Sharpe 0.60)
+- 🔄 下一步方向：DANN+LGBM 集成 / CDAN / 风险约束
 
 ---
 

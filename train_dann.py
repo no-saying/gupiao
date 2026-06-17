@@ -1,11 +1,26 @@
-"""DANN 域自适应训练 — 500训练 + 300选股"""
-import torch, numpy as np, time, sys
+"""DANN 域自适应训练 — 500训练 + 300选股
+
+Usage:
+  python train_dann.py                        # MSE (默认)
+  python train_dann.py --loss margin          # Margin Ranking Loss
+  python train_dann.py --loss lambdarank      # LambdaRank 损失
+"""
+import argparse, torch, numpy as np, time, sys
 sys.path.insert(0, '.')
 from config import MODEL_DIR, DEVICE
 from core.dann_model import DANNStockModel, dann_loss, build_domain_labels
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--loss", type=str, default="mse",
+                    choices=["mse", "margin", "lambdarank"],
+                    help="Task loss type")
+parser.add_argument("--epochs", type=int, default=200)
+parser.add_argument("--lr", type=float, default=3e-4)
+args = parser.parse_args()
+
 device = torch.device(DEVICE)
 torch.cuda.empty_cache()
+print(f"Loss: {args.loss} | epochs: {args.epochs} | lr: {args.lr}")
 
 # 数据
 from tushare_loader import TUSHARE_DIR, fetch_csi300_stocks, fetch_csi500_stocks
@@ -55,15 +70,15 @@ print(f"Params: {sum(p.numel() for p in model.parameters()):,}")
 # 域标签张量（每 batch 复用）
 domain_labels_all = torch.FloatTensor(domain_arr).to(device)  # (N,)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 200)
+optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.epochs)
 
 X_cpu = torch.FloatTensor(X)
 y_cpu = torch.FloatTensor(y)
 batch_size = 4
 
 t0 = time.time()
-for epoch in range(200):
+for epoch in range(args.epochs):
     model.train()
     epoch_task, epoch_dom = 0.0, 0.0
     indices = torch.randperm(n_windows)
@@ -77,7 +92,8 @@ for epoch in range(200):
         scores, domain_logits = model(x_batch)
         domain_labels = domain_labels_all.unsqueeze(0).expand(B, -1).reshape(-1)
 
-        result = dann_loss(scores, y_batch, domain_logits, domain_labels, lambda_domain=0.5)
+        result = dann_loss(scores, y_batch, domain_logits, domain_labels,
+                           lambda_domain=0.5, task_loss_type=args.loss)
         result['total'].backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step(); optimizer.zero_grad()
@@ -89,12 +105,13 @@ for epoch in range(200):
 
     if (epoch + 1) % 10 == 0:
         n_batch = max(1, n_windows // batch_size)
-        print(f"  E{epoch+1:3d}/200 | task={epoch_task/n_batch:.4f} | "
+        print(f"  E{epoch+1:3d}/{args.epochs} [{args.loss}] | task={epoch_task/n_batch:.4f} | "
               f"domain={epoch_dom/n_batch:.4f} | {time.time()-t0:.0f}s", flush=True)
 
 # 保存
-torch.save(model.state_dict(), MODEL_DIR / "dann_model.pt")
-print(f"Saved to dann_model.pt")
+model_name = f"dann_{args.loss}.pt"
+torch.save(model.state_dict(), MODEL_DIR / model_name)
+print(f"Saved to {model_name}")
 
 # 只在 CSI 300 上评估
 model.eval()
